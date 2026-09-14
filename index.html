@@ -1192,7 +1192,7 @@
       <div class="grid grid-2" style="margin-bottom:24px;">
         <div class="card" style="text-align:center;padding:24px 20px;">
           <h4 style="margin-bottom:14px;">Escanear ingreso</h4>
-          <div id="qrReaderAdmin" style="max-width:280px;margin:0 auto 14px;border-radius:12px;overflow:hidden;"></div>
+          <div id="qrReaderAdmin" style="width:100%;max-width:360px;margin:0 auto 14px;border-radius:12px;"></div>
           <p style="font-size:.82rem;color:var(--off-dim);">Apuntá la cámara al QR del alumno para registrar su ingreso.</p>
           <div id="qrScanResult" style="margin-top:14px;font-size:.85rem;min-height:20px;"></div>
         </div>
@@ -1432,6 +1432,18 @@
     </div>
 
     <!-- ============ ALUMNO: MODO ENTRENAMIENTO (guiado, pantalla completa) ============ -->
+    <!-- ============ QR AMPLIADO (para escanear más fácil) ============ -->
+    <div class="modal-overlay" id="qrZoomModal" onclick="if(event.target===this) cerrarQrAmpliado();">
+      <div class="modal-box" style="text-align:center;max-width:360px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+          <h3 style="margin:0;" id="qrZoomTitulo">Código de acceso</h3>
+          <span style="cursor:pointer;color:var(--off-dim);" onclick="cerrarQrAmpliado()">✕</span>
+        </div>
+        <div style="background:#fff;border-radius:12px;padding:16px;display:inline-block;"><canvas id="qrZoomCanvas"></canvas></div>
+        <p style="font-size:.78rem;color:var(--off-dim);margin-top:14px;">Acercalo bien a la cámara para que se lea sin problema.</p>
+      </div>
+    </div>
+
     <div class="modal-overlay" id="workoutPlayerModal" style="align-items:stretch;">
       <div class="modal-box" style="max-width:480px;width:100%;margin:auto;padding:0;overflow:hidden;">
         <div style="display:flex;justify-content:space-between;align-items:center;padding:16px 18px;border-bottom:1px solid rgba(242,237,228,.12);">
@@ -2313,6 +2325,17 @@ async function logoutFirebase(){
 }
 
 // ===== QR: "Mi acceso" (alumno) =====
+function ampliarQR(payload, titulo){
+  document.getElementById('qrZoomTitulo').textContent = titulo || 'Código de acceso';
+  document.getElementById('qrZoomModal').classList.add('active');
+  QRCode.toCanvas(document.getElementById('qrZoomCanvas'), payload, { width: 300, margin: 3 }, (err) => {
+    if(err) console.error('Error generando el QR ampliado:', err);
+  });
+}
+function cerrarQrAmpliado(){
+  document.getElementById('qrZoomModal').classList.remove('active');
+}
+
 function renderQRInto(canvasId, retried){
   const canvas = document.getElementById(canvasId);
   if(!canvas) return;
@@ -2326,10 +2349,16 @@ function renderQRInto(canvasId, retried){
     return;
   }
   const payload = 'SINERGIA-ALUMNO:' + currentUser.uid;
-  QRCode.toCanvas(canvas, payload, { width: 160, margin: 1 }, (err) => {
+  // Más grande y con más margen (zona blanca alrededor) que antes: un QR muy chico o muy
+  // apretado, con un texto largo adentro, le cuesta mucho más a la cámara leerlo bien.
+  QRCode.toCanvas(canvas, payload, { width: 220, margin: 3 }, (err) => {
     if(err){
       canvas.insertAdjacentHTML('afterend', '<p style="color:#e0574a;font-size:.8rem;">Error generando el QR: ' + err.message + '</p>');
+      return;
     }
+    canvas.style.cursor = 'pointer';
+    canvas.title = 'Tocá para agrandar';
+    canvas.onclick = () => ampliarQR(payload, 'Mi código de acceso');
   });
 }
 function renderMiAcceso(){
@@ -2339,32 +2368,59 @@ function renderMiAcceso(){
 // ===== QR: "Escanear ingreso" (admin) =====
 let qrScannerInstance = null;
 let scannerBusy = false;
+let scannerStarting = false; // evita arranques duplicados mientras la cámara está negociando permisos
 
-function startScanner(){
+async function startScanner(){
   if(currentRole !== 'admin') return;
   if(typeof Html5Qrcode === 'undefined'){
     document.getElementById('qrScanResult').textContent = 'No se pudo cargar el lector de QR (revisá tu conexión).';
     return;
   }
-  if(qrScannerInstance) return; // ya está corriendo
+  if(qrScannerInstance || scannerStarting) return; // ya está corriendo o arrancando
+  scannerStarting = true;
   scannerBusy = false;
-  qrScannerInstance = new Html5Qrcode('qrReaderAdmin');
-  qrScannerInstance.start(
-    { facingMode: 'environment' },
-    { fps: 10, qrbox: 220 },
-    onScanSuccess,
-    () => {} // errores de lectura frame a frame: se ignoran, es normal mientras enfoca
-  ).catch(err => {
-    document.getElementById('qrScanResult').textContent = 'No se pudo activar la cámara: ' + (err.message || err);
-  });
+  const resultEl = document.getElementById('qrScanResult');
+  resultEl.textContent = 'Activando cámara...';
+  const instancia = new Html5Qrcode('qrReaderAdmin');
+  try{
+    await instancia.start(
+      { facingMode: 'environment' },
+      { fps: 10, qrbox: (anchoVisor, altoVisor) => {
+          // El recuadro de escaneo se calcula según el tamaño REAL que ocupa la cámara en
+          // pantalla (en vez de un número fijo en píxeles), para que siempre coincida con
+          // lo que se ve — antes, en algunas pantallas/tamaños, el recuadro quedaba
+          // desalineado con la imagen visible y por eso no detectaba nada.
+          const lado = Math.floor(Math.min(anchoVisor, altoVisor) * 0.7);
+          return { width: lado, height: lado };
+        } },
+      onScanSuccess,
+      () => {} // errores de lectura frame a frame: se ignoran, es normal mientras enfoca
+    );
+    qrScannerInstance = instancia;
+    resultEl.innerHTML = `Apuntá la cámara al QR del alumno. <span style="cursor:pointer;color:var(--forge);text-decoration:underline;" onclick="reiniciarScanner()">🔄 Reiniciar cámara</span>`;
+  }catch(err){
+    // Importante: NO dejamos qrScannerInstance seteado si start() falló, si no los próximos
+    // intentos quedan bloqueados en silencio para siempre (era exactamente el bug reportado).
+    qrScannerInstance = null;
+    console.error('No se pudo activar la cámara:', err);
+    resultEl.innerHTML = `<span style="color:#e0574a;">No se pudo activar la cámara: ${err.message || err}</span><br>
+      <span style="cursor:pointer;color:var(--forge);text-decoration:underline;font-size:.82rem;" onclick="reiniciarScanner()">🔄 Reintentar</span>`;
+  }
+  scannerStarting = false;
 }
 
-function stopScanner(){
+async function reiniciarScanner(){
+  await stopScanner();
+  startScanner();
+}
+
+async function stopScanner(){
   if(qrScannerInstance){
+    const inst = qrScannerInstance;
+    qrScannerInstance = null; // liberamos la referencia ya, pase lo que pase con stop()
     try{
-      const inst = qrScannerInstance;
-      qrScannerInstance = null; // liberamos la referencia ya, pase lo que pase con stop()
-      inst.stop().then(() => inst.clear()).catch(()=>{});
+      await inst.stop();
+      inst.clear();
     }catch(err){ console.error('Error deteniendo el lector QR (se ignora, no bloquea el resto):', err); }
   }
 }
@@ -2583,7 +2639,7 @@ function updateAcctNavVisibility(){
   if(salirMobile) salirMobile.style.display = logueado ? '' : 'none';
 }
 
-function enterApp(role){
+async function enterApp(role){
   document.getElementById('publicSite').style.display = 'none';
   document.getElementById('gate').classList.remove('active');
   document.getElementById('appwrap').classList.add('active');
@@ -2594,8 +2650,8 @@ function enterApp(role){
   updateAcctNavVisibility();
 
   if(currentRole==='admin'){
+    await loadAlumnosReales(); // esperamos a tener los alumnos ANTES de armar la lista de ingresos de hoy
     renderDashboard(); renderCuotasTable('all'); renderCharts();
-    loadAlumnosReales();
     renderNotifAdmin();
     showView('inicioAdmin');
     checkInstallUI();
@@ -2613,6 +2669,7 @@ function limpiarModalHistorialSuelto(){
   if(modalSuelto) modalSuelto.remove();
   const modalQr = document.getElementById('qrAccesoModalDinamico');
   if(modalQr) modalQr.remove();
+  cerrarQrAmpliado();
 }
 
 async function cambiarPassword(){
@@ -2941,8 +2998,12 @@ async function handleAddStudent(event){
     document.getElementById('asForm').style.display = 'none';
     document.getElementById('asResultado').style.display = 'block';
     document.getElementById('asModalTitle').textContent = nombre;
-    QRCode.toCanvas(document.getElementById('asQrCanvasEl'), linkAcceso, { width: 200, margin: 1 }, (err) => {
-      if(err) document.getElementById('asQrCanvas').insertAdjacentHTML('beforeend', '<p style="color:#e0574a;font-size:.8rem;">Error generando el QR.</p>');
+    QRCode.toCanvas(document.getElementById('asQrCanvasEl'), linkAcceso, { width: 240, margin: 3 }, (err) => {
+      if(err){ document.getElementById('asQrCanvas').insertAdjacentHTML('beforeend', '<p style="color:#e0574a;font-size:.8rem;">Error generando el QR.</p>'); return; }
+      const canvasEl = document.getElementById('asQrCanvasEl');
+      canvasEl.style.cursor = 'pointer';
+      canvasEl.title = 'Tocá para agrandar';
+      canvasEl.onclick = () => ampliarQR(linkAcceso, 'Acceso de ' + nombre);
     });
 
     await loadAlumnosReales();
@@ -2980,10 +3041,18 @@ async function loadIngresos(filtro, targetId){
   if(!el) return;
   el.innerHTML = '<p style="font-size:.85rem;color:var(--off-dim);">Cargando...</p>';
   try{
+    // Antes se pedía el listado de ingresos de cada alumno UNO POR UNO (esperando a que
+    // termine el anterior antes de pedir el siguiente) — con muchos alumnos eso se sentía
+    // lento. Ahora se piden todos al mismo tiempo y se juntan al final.
+    const resultados = await Promise.all(ALUMNOS_REALES.map(s =>
+      window.fb.getDocs(window.fb.collection(window.fb.db, 'users', s.id, 'checkins'))
+        .then(snap => ({ s, snap }))
+        .catch(err => { console.error('Error cargando ingresos de ' + s.name + ':', err); return null; })
+    ));
     const todos = [];
-    for(const s of ALUMNOS_REALES){
-      const snap = await window.fb.getDocs(window.fb.collection(window.fb.db, 'users', s.id, 'checkins'));
-      snap.forEach(doc=>{
+    resultados.forEach(r => {
+      if(!r) return;
+      r.snap.forEach(doc=>{
         const data = doc.data();
         let fecha;
         if(data.timestamp && typeof data.timestamp.toDate === 'function'){
@@ -2996,9 +3065,9 @@ async function loadIngresos(filtro, targetId){
           // para que no desaparezca de la lista.
           fecha = new Date();
         }
-        todos.push({ nombre: s.name, fecha });
+        todos.push({ nombre: r.s.name, fecha });
       });
-    }
+    });
     ingresosCache = todos;
   }catch(err){
     el.innerHTML = `<p style="font-size:.85rem;color:#e0574a;">No se pudieron cargar los ingresos (${err.code || err.message}).</p>`;
@@ -3059,7 +3128,13 @@ function mostrarQrAcceso(uid){
       </div>
     </div>`;
   document.body.insertAdjacentHTML('beforeend', modalHTML);
-  QRCode.toCanvas(document.getElementById('qrAccesoCanvasEl'), linkAcceso, { width: 220, margin: 1 }, () => {});
+  QRCode.toCanvas(document.getElementById('qrAccesoCanvasEl'), linkAcceso, { width: 240, margin: 3 }, (err) => {
+    if(err) return;
+    const canvasEl = document.getElementById('qrAccesoCanvasEl');
+    canvasEl.style.cursor = 'pointer';
+    canvasEl.title = 'Tocá para agrandar';
+    canvasEl.onclick = () => ampliarQR(linkAcceso, 'Acceso de ' + s.name);
+  });
 }
 
 function mostrarEdicionDatosAlumno(uid){
