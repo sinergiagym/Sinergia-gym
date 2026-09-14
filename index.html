@@ -2985,9 +2985,18 @@ async function loadIngresos(filtro, targetId){
       const snap = await window.fb.getDocs(window.fb.collection(window.fb.db, 'users', s.id, 'checkins'));
       snap.forEach(doc=>{
         const data = doc.data();
-        if(data.timestamp && data.timestamp.toDate){
-          todos.push({ nombre: s.name, fecha: data.timestamp.toDate() });
+        let fecha;
+        if(data.timestamp && typeof data.timestamp.toDate === 'function'){
+          fecha = data.timestamp.toDate();
+        }else if(data.timestamp instanceof Date){
+          fecha = data.timestamp;
+        }else{
+          // El servidor todavía no terminó de confirmar el "serverTimestamp()" (pasa justo
+          // después de escanear). En vez de descartar el ingreso, lo mostramos como "ahora"
+          // para que no desaparezca de la lista.
+          fecha = new Date();
         }
+        todos.push({ nombre: s.name, fecha });
       });
     }
     ingresosCache = todos;
@@ -4539,8 +4548,10 @@ async function loadWeeklyStreak(){
     const snap = await window.fb.getDocs(window.fb.collection(window.fb.db, 'users', currentUser.uid, 'checkins'));
     snap.forEach(doc=>{
       const data = doc.data();
-      if(!data.timestamp || !data.timestamp.toDate) return;
-      const fecha = data.timestamp.toDate();
+      let fecha;
+      if(data.timestamp && typeof data.timestamp.toDate === 'function') fecha = data.timestamp.toDate();
+      else if(data.timestamp instanceof Date) fecha = data.timestamp;
+      else fecha = new Date(); // timestamp del servidor todavía sin confirmar: lo contamos como "ahora"
       if(fecha >= inicioSemana) marcados.add(DAY_BY_JS_INDEX[fecha.getDay()]);
     });
   }catch(err){ console.error('Error cargando asistencias:', err); }
