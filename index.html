@@ -2367,8 +2367,8 @@ function renderMiAcceso(){
 
 // ===== QR: "Escanear ingreso" (admin) =====
 let qrScannerInstance = null;
-let scannerBusy = false;
 let scannerStarting = false; // evita arranques duplicados mientras la cámara está negociando permisos
+let recentScans = {}; // uid -> timestamp del último ingreso registrado (cooldown por alumno)
 
 async function startScanner(){
   if(currentRole !== 'admin') return;
@@ -2378,7 +2378,6 @@ async function startScanner(){
   }
   if(qrScannerInstance || scannerStarting) return; // ya está corriendo o arrancando
   scannerStarting = true;
-  scannerBusy = false;
   const resultEl = document.getElementById('qrScanResult');
   resultEl.textContent = 'Activando cámara...';
   const instancia = new Html5Qrcode('qrReaderAdmin');
@@ -2480,7 +2479,7 @@ document.addEventListener('click', (e) => {
 
 
 async function onScanSuccess(decodedText){
-  if(scannerBusy) return;
+  console.log('[Sinergia] QR detectado:', decodedText); // ayuda a diagnosticar si esto no aparece en la consola
   const resultEl = document.getElementById('qrScanResult');
   const match = decodedText.match(/^SINERGIA-ALUMNO:(.+)$/);
   if(!match){
@@ -2492,7 +2491,7 @@ async function onScanSuccess(decodedText){
   if(recentScans[uid] && (Date.now() - recentScans[uid]) < COOLDOWN_MS){
     return; // mismo alumno, todavía frente a la cámara: se ignora en silencio
   }
-  scannerBusy = true;
+  recentScans[uid] = Date.now(); // se marca ANTES de terminar de escribir, para no disparar 2 registros si llegan lecturas casi juntas
   resultEl.textContent = 'Registrando...';
   try{
     const snap = await window.fb.getDoc(window.fb.doc(window.fb.db, 'users', uid));
@@ -2503,7 +2502,6 @@ async function onScanSuccess(decodedText){
       window.fb.collection(window.fb.db, 'users', uid, 'checkins'),
       { timestamp: window.fb.serverTimestamp() }
     );
-    recentScans[uid] = Date.now();
     let cuotaHTML = '';
     if(info){
       cuotaHTML = `<div style="margin-top:6px;">${badgeFor(info.quota)} <span style="color:var(--off-dim);">· Vence ${fmtDate(info.due)}</span></div>`;
@@ -2514,10 +2512,11 @@ async function onScanSuccess(decodedText){
       loadIngresos('hoy', 'ingresosListaInicio');
     }
   }catch(err){
+    console.error('[Sinergia] Error registrando el ingreso:', err);
     resultEl.innerHTML = `<span style="color:#e0574a;">No se pudo registrar (${err.code || err.message}).</span>`;
+    delete recentScans[uid]; // si falló, no lo dejamos "quemado" en cooldown — que se pueda reintentar ya mismo
   }
-  setTimeout(() => { scannerBusy = false; }, 2000); // solo frena la cámara un toque, no el cooldown por alumno
-  setTimeout(() => { if(resultEl.textContent || resultEl.innerHTML) resultEl.innerHTML = ''; }, 7000);
+  setTimeout(() => { if(resultEl && (resultEl.textContent || resultEl.innerHTML)) resultEl.innerHTML = ''; }, 7000);
 }
 
 // Al cargar la página, si ya había una sesión activa, entra directo sin mostrar el gate.
