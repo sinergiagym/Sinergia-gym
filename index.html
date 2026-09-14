@@ -4519,8 +4519,30 @@ async function guardarMiPerfil(){
 }
 let currentMisRutinasDia = null;
 
+// Si la cuota está vencida, el alumno no puede acceder a sus rutinas hasta que se registre
+// el pago — pero nunca se le borra nada (rutina, progreso, historial): solo queda bloqueado
+// hasta que el estado de la cuota vuelva a estar al día.
+function cuentaBloqueadaPorCuota(s){
+  return s.quota === 'bad';
+}
+function renderAvisoCuotaVencida(s){
+  return `
+    <div class="card" style="text-align:center;padding:32px 20px;border:1px solid #e0574a55;">
+      <div style="font-size:2.2rem;margin-bottom:10px;">🔒</div>
+      <h3 style="margin-bottom:8px;">Tu cuota está vencida</h3>
+      <p style="font-size:.88rem;color:var(--off-dim);max-width:360px;margin:0 auto 18px;">
+        Para volver a ver tus rutinas y marcar tu progreso, primero regularizá tu cuota. En cuanto quede registrado el pago, recuperás el acceso automáticamente — no se pierde nada de lo que ya tenías cargado.
+      </p>
+      <span class="btn btn-solid btn-small" onclick="showView('miCuota')">Ver cómo pagar mi cuota</span>
+    </div>`;
+}
+
 function renderMisRutinas(){
   const s = currentStudentReal || STUDENTS[currentStudentId];
+  if(cuentaBloqueadaPorCuota(s)){
+    document.getElementById('misRutinasContent').innerHTML = renderAvisoCuotaVencida(s);
+    return;
+  }
   if(!s.rutinaActiva){
     document.getElementById('misRutinasContent').innerHTML = `<div class="card">
       <p style="font-size:.85rem;">Todavía no tenés una rutina asignada. Tu entrenador te la va a cargar pronto — volvé a revisar más tarde.</p>
@@ -4567,13 +4589,17 @@ async function renderInicio(){
   const claves = s.rutinaActiva ? ordenarClavesDias(s.rutinaActiva.dias) : [];
 
   document.getElementById('inicioContent').innerHTML = `
-    <div class="card" style="margin-bottom:20px;">
-      <span class="eyebrow">Tu rutina</span>
-      ${s.rutinaActiva ? `
-        <h3 style="margin:8px 0 4px;">${s.rutinaActiva.nombre}</h3>
-        <p style="font-size:.8rem;color:var(--off-dim);margin-bottom:14px;">${claves.length} día${claves.length===1?'':'s'} asignados</p>
-        <span class="btn btn-solid btn-small" onclick="showView('misRutinas')">Ver mis rutinas</span>
-      ` : `<p style="font-size:.85rem;color:var(--off-dim);">Todavía no tenés una rutina asignada.</p>`}
+    <div style="margin-bottom:20px;">
+      ${cuentaBloqueadaPorCuota(s) ? renderAvisoCuotaVencida(s) : `
+        <div class="card">
+          <span class="eyebrow">Tu rutina</span>
+          ${s.rutinaActiva ? `
+            <h3 style="margin:8px 0 4px;">${s.rutinaActiva.nombre}</h3>
+            <p style="font-size:.8rem;color:var(--off-dim);margin-bottom:14px;">${claves.length} día${claves.length===1?'':'s'} asignados</p>
+            <span class="btn btn-solid btn-small" onclick="showView('misRutinas')">Ver mis rutinas</span>
+          ` : `<p style="font-size:.85rem;color:var(--off-dim);">Todavía no tenés una rutina asignada.</p>`}
+        </div>
+      `}
     </div>
     <div class="grid grid-2" style="margin-bottom:20px;align-items:stretch;">
       <div class="card" style="text-align:center;">
@@ -4646,6 +4672,10 @@ let wpState = null; // { sid, ri, steps:[{ei,setIndex,totalSets}], stepIdx, phas
 function startWorkout(sid, diaKey){
   const isReal = currentStudentReal && currentStudentReal.id === sid;
   const s = isReal ? currentStudentReal : STUDENTS[sid];
+  if(isReal && cuentaBloqueadaPorCuota(s)){
+    alert('Tu cuota está vencida. Regularizala para poder entrenar de nuevo.');
+    return;
+  }
   const dia = s.rutinaActiva.dias[diaKey];
   const steps = [];
   dia.ejercicios.forEach((e, ei) => {
@@ -4754,6 +4784,10 @@ function markExerciseDoneFromWorkout(sid, diaKey, ei){
 async function toggleExercise(sid, diaKey, ei){
   const isReal = currentStudentReal && currentStudentReal.id === sid;
   const s = isReal ? currentStudentReal : STUDENTS[sid];
+  if(isReal && cuentaBloqueadaPorCuota(s)){
+    alert('Tu cuota está vencida. Regularizala para poder seguir marcando tu progreso.');
+    return;
+  }
   const dia = s.rutinaActiva.dias[diaKey];
   const ex = dia.ejercicios[ei];
   ex.done = !ex.done;
