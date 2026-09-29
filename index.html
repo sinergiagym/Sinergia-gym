@@ -2296,10 +2296,16 @@ async function handleOnboarding(event){
     // accessPass: si el documento ya tenía uno, se conserva; si no, se usa la contraseña con la que
     // se acaba de registrar/ingresar. Se guarda ANTES de entrar a la app y se verifica leyendo de vuelta.
     let accessPassExistente = null;
+    let perfilPrevio = null;
     try{
       const prev = await window.fb.getDoc(window.fb.doc(window.fb.db, 'users', user.uid));
-      if(prev.exists() && prev.data().accessPass) accessPassExistente = prev.data().accessPass;
-    }catch(err){ console.error('No se pudo leer el perfil previo (se continúa):', err); }
+      if(prev.exists()){ perfilPrevio = prev.data() || {}; if(perfilPrevio.accessPass) accessPassExistente = perfilPrevio.accessPass; }
+    }catch(err){
+      // Sin poder leer el perfil previo no se escribe nada (podría pisar plan/rutina de un perfil existente).
+      errorEl.textContent = 'No se pudo verificar tu perfil (' + (err.code || err.message) + '). Revisá la conexión e intentá de nuevo.';
+      btn.disabled = false; btn.textContent = 'Guardar y entrar';
+      return false;
+    }
     const passParaAcceso = accessPassExistente ? null : (passRegistroPendiente || passLoginManual);
     const profileData = {
       role: 'alumno', name: user.displayName || 'Alumno', email: normalizarEmail(user.email),
@@ -2310,6 +2316,14 @@ async function handleOnboarding(event){
       completion: 0, rutinaActiva: null, weightHistory: [weight], workouts: 0, goalsReached: 0
     };
     if(passParaAcceso) profileData.accessPass = passParaAcceso;
+    // Si ya existía un documento (perfil incompleto), no se pisan los datos que ya tenía
+    // (plan, monto, rutina, pagos, etc.): solo se completan los del formulario y los faltantes.
+    if(perfilPrevio){
+      const camposDelFormulario = ['age','dni','weight','height','goal','profileCompleted'];
+      Object.keys(profileData).forEach(k => {
+        if(!camposDelFormulario.includes(k) && perfilPrevio[k] !== undefined && perfilPrevio[k] !== null) delete profileData[k];
+      });
+    }
     await window.fb.setDoc(window.fb.doc(window.fb.db, 'users', user.uid), profileData, { merge: true });
     const snap = await window.fb.getDoc(window.fb.doc(window.fb.db, 'users', user.uid));
     if(!snap.data().accessPass){
@@ -2744,8 +2758,10 @@ function initAuthListener(){
     loadGymAlias();
     let role = 'alumno';
     let data = null;
+    let lecturaPerfilOk = false; // true solo si Firestore respondió (exista o no el documento)
     try{
       const snap = await window.fb.getDoc(window.fb.doc(window.fb.db, 'users', user.uid));
+      lecturaPerfilOk = true;
       if(snap.exists()){ data = snap.data(); if(data.role === 'admin') role = 'admin'; }
     }catch(err){ /* si falla la lectura, entra como alumno por defecto */ }
 
@@ -2755,7 +2771,9 @@ function initAuthListener(){
         // Recién registrado, o alguien que se registró pero no terminó el perfil y ahora entra
         // a propósito con su email y contraseña: se le muestra el formulario para completarlo
         // (antes quedaba trabado para siempre: no podía registrarse de nuevo ni ingresar).
-        if(justSignedUp || passLoginManual){
+        // Con login manual, SOLO si la lectura del perfil funcionó: si falló (red/permisos) no se
+        // sabe si el perfil existe, y no hay que ofrecer un formulario que podría pisar datos.
+        if(justSignedUp || (passLoginManual && lecturaPerfilOk)){
           pendingOnboardingUser = user;
           document.getElementById('pwaLoading').style.display = 'none';
           showOnboardingForm();
@@ -3764,7 +3782,9 @@ function getMondayISO(date){
 // La clave es el nombre del ejercicio normalizado, así el historial sobrevive a resets semanales
 // y a cambios de plantilla (si la rutina nueva vuelve a tener "Press banca", sigue el mismo historial).
 // En cada ejercicio de rutinaActiva se sigue guardando `peso` (último peso) para mostrarlo rápido.
-const MAX_REGISTROS_PESO_POR_EJERCICIO = 150;
+// Límite por ejercicio para que el documento del alumno no se acerque al máximo de 1 MB de Firestore
+// (60 registros ≈ más de un año entrenando ese ejercicio una vez por semana).
+const MAX_REGISTROS_PESO_POR_EJERCICIO = 60;
 
 function claveEjercicio(nombre){
   const base = quitarAcentos(String(nombre || '').trim().toLowerCase()).replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
@@ -4161,8 +4181,11 @@ async function confirmarAsignarPlantilla(){
       semana: s.routinesWeekStart || null, completion: s.completion || 0,
       rutina: JSON.parse(JSON.stringify(s.rutinaActiva))
     };
-    payload.rutinasAnteriores = [...(s.rutinasAnteriores || []), archivada].slice(-10);
+    payload.rutinasAnteriores = [...(s.rutinasAnteriores || []), archivada].slice(-5);
   }
+  // Si había historial viejo guardado DENTRO de los ejercicios (historialPeso), ya fue incorporado
+  // en memoria a s.historialPesos: se persiste ahora para que no dependa de la rutina que se reemplaza.
+  if(s.historialPesos && Object.keys(s.historialPesos).length) payload.historialPesos = s.historialPesos;
   try{
     await window.fb.setDoc(window.fb.doc(window.fb.db, 'users', uid), payload, { merge: true });
     s.rutinaActiva = clon;
@@ -4908,12 +4931,6 @@ function renderDonut(containerId, values){
   let acc = 0;
   const stops = values.map(v=>{ const start = acc/total*360; acc += v.value; const end = acc/total*360; return `${v.color} ${start}deg ${end}deg`; }).join(', ');
   document.getElementById(containerId).style.background = `conic-gradient(${stops})`;
-}
-function getInicioMes(date = new Date()){
-  return new Date(date.getFullYear(), date.getMonth(), 1, 0, 0, 0, 0);
-}
-function getFinMes(date = new Date()){
-  return new Date(date.getFullYear(), date.getMonth() + 1, 0, 23, 59, 59, 999);
 }
 function mesKey(date){
   return `${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,'0')}`;
