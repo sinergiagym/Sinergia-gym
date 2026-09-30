@@ -1221,13 +1221,22 @@
       <div class="grid grid-4" style="margin-bottom:24px;">
         <div class="card stat-card"><span class="num" id="kpiActivos">0</span><span class="label">Alumnos activos</span></div>
         <div class="card stat-card"><span class="num" id="kpiNuevos">0</span><span class="label">Nuevos este mes</span></div>
-        <div class="card stat-card"><span class="num" id="kpiIngresos">0</span><span class="label">Ingresos proyectados (planes activos)</span></div>
+        <div class="card stat-card"><span class="num" id="kpiIngresos">0</span><span class="label">Ingresos cobrados este mes (pagos registrados)</span></div>
+        <div class="card stat-card"><span class="num" id="kpiNeto">$0</span><span class="label">Resultado neto del mes (cobrado − gastos)</span></div>
       </div>
       <div class="grid grid-3" style="margin-bottom:24px;">
         <div class="card stat-card"><span class="num" id="kpiPagadas">0</span><span class="label">Cuotas al día</span></div>
         <div class="card stat-card"><span class="num" id="kpiProximas">0</span><span class="label">Cuotas próximas a vencer</span></div>
         <div class="card stat-card"><span class="num" id="kpiVencidas">0</span><span class="label">Cuotas vencidas</span></div>
-        <div class="card stat-card"><span class="num" id="totalIngresosMesActual">$0</span><span class="label">Facturado este mes</span></div>
+        <div class="card stat-card"><span class="num" id="kpiProyectado">$0</span><span class="label">Proyectado mensual (planes activos, no cobrado)</span></div>
+      </div>
+      <div class="grid grid-3" style="margin-bottom:24px;">
+        <div class="card stat-card"><span class="num" id="kpiGastos">$0</span><span class="label">Gastos del mes</span></div>
+        <div class="card stat-card"><span class="num" id="kpiPendiente">$0</span><span class="label">Pendiente de cobro (cuotas vencidas)</span></div>
+        <div class="card" style="display:flex;flex-direction:column;justify-content:center;gap:10px;">
+          <span style="font-size:.78rem;color:var(--off-dim);" id="kpiFinanzasNota">Cargá los gastos del mes para ver el resultado neto.</span>
+          <span class="btn btn-solid btn-small" onclick="openHistorialMesModal(mesKey(new Date()))">Gastos y cierre del mes</span>
+        </div>
       </div>
       <div class="grid grid-2">
         <div class="card">
@@ -1510,7 +1519,7 @@
     <!-- ============ ADMIN: HISTORIAL MENSUAL DE FACTURACIÓN ============ -->
     <section class="app-view" id="view-historialMensual">
       <div class="topline"><div><span class="eyebrow">Facturación</span><h1>Historial mensual</h1></div></div>
-      <p style="font-size:.85rem;color:var(--off-dim);margin-bottom:18px;">Tocá un mes para ver el detalle de los pagos registrados.</p>
+      <p style="font-size:.85rem;color:var(--off-dim);margin-bottom:18px;">Tocá un mes para ver los pagos cobrados, cargar los gastos y descargar el resumen (cierre mensual).</p>
       <div class="grid grid-3" id="historialMensualGrid"></div>
     </section>
 
@@ -1582,6 +1591,14 @@
         </p>
         <div id="configPlantillasGrid" style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px;"></div>
         <button type="button" class="btn btn-ghost btn-small" onclick="crearPlantillaVaciaDesdeConfig()">+ Nueva plantilla</button>
+      </div>
+      <div class="card" style="margin-top:18px;">
+        <h4>Mantenimiento de datos existentes</h4>
+        <p style="font-size:.8rem;color:var(--off-dim);margin-bottom:14px;">
+          Revisa los alumnos guardados y completa datos de versiones anteriores (rol faltante, emails con mayúsculas, vencimientos en formato viejo). Primero muestra qué cambiaría; no borra nada.
+        </p>
+        <button type="button" class="btn btn-ghost btn-small" onclick="revisarDatosExistentes()">🔎 Revisar datos</button>
+        <div id="mantenimientoResultado" style="margin-top:14px;font-size:.84rem;"></div>
       </div>
     </section>
 
@@ -1857,6 +1874,7 @@ function badgeFor(q){
   if(q==='ok') return '<span class="badge ok">Al día</span>';
   if(q==='warn') return '<span class="badge warn">Por vencer</span>';
   if(q==='pending') return '<span class="badge warn">Sin asignar</span>';
+  if(q==='nodate') return '<span class="badge warn">Sin fecha de venc.</span>';
   if(q==='frozen') return '<span class="badge warn">Congelada</span>';
   return '<span class="badge bad">Vencida</span>';
 }
@@ -1929,7 +1947,7 @@ function maybeShowQuotaToast(){
   if(q !== 'warn' && q !== 'bad') return;
   const urgente = q === 'bad';
   const msg = urgente
-    ? '⚠️ Tu cuota está vencida. Podés abonarla desde "Mi cuota".'
+    ? '⚠️ Tu cuota está vencida: tus rutinas quedan en pausa hasta regularizarla. Tu cuenta sigue activa — revisá "Mi cuota".'
     : '⏰ Tu cuota está por vencer. Recordá abonarla desde "Mi cuota".';
   showToast(msg, urgente);
 }
@@ -2058,13 +2076,39 @@ function populateAsPlanSelect(){
 
 let alumnosLoadError = null;
 
+// Un documento de users/ SIN campo role se considera alumno solo si tiene datos de perfil
+// (nombre, email o perfil completo). Nunca se incluyen docs con role 'admin' u otro rol.
+function esAlumnoSinRole(data){
+  return !!data && !data.role && !!(data.name || data.email || data.profileCompleted);
+}
+
+// Trae los alumnos: role == 'alumno' + alumnos viejos sin role. Primero intenta leer toda la
+// colección y filtrar acá; si las reglas de Firestore no permiten eso, cae a la consulta
+// original por role (así nunca queda peor que antes).
+async function obtenerDocsAlumnos(){
+  const porId = new Map();
+  try{
+    const snapTodos = await window.fb.getDocs(window.fb.collection(window.fb.db, 'users'));
+    snapTodos.forEach(d => {
+      const data = d.data();
+      if(data && (data.role === 'alumno' || esAlumnoSinRole(data))) porId.set(d.id, data);
+    });
+    return porId;
+  }catch(err){
+    console.warn('No se pudo leer toda la colección users (se usa el filtro por role):', err);
+  }
+  const q = window.fb.query(window.fb.collection(window.fb.db, 'users'), window.fb.where('role', '==', 'alumno'));
+  const snap = await window.fb.getDocs(q);
+  snap.forEach(d => porId.set(d.id, d.data()));
+  return porId;
+}
+
 async function loadAlumnosReales(){
   alumnosLoadError = null;
   try{
-    const q = window.fb.query(window.fb.collection(window.fb.db, 'users'), window.fb.where('role', '==', 'alumno'));
-    const snap = await window.fb.getDocs(q);
+    const docs = await obtenerDocsAlumnos();
     ALUMNOS_REALES = [];
-    snap.forEach(d => ALUMNOS_REALES.push(normalizeStudentData(d.id, d.data())));
+    docs.forEach((data, id) => ALUMNOS_REALES.push(normalizeStudentData(id, data)));
   }catch(err){
     console.error('Error cargando alumnos:', err);
     ALUMNOS_REALES = [];
@@ -2114,15 +2158,19 @@ async function handleLogin(event){
   event.preventDefault();
   const errorEl = document.getElementById('loginError');
   if(!window.fb){ errorEl.textContent = 'Todavía no se conectó con el servidor. Esperá unos segundos y probá de nuevo.'; return false; }
-  const email = document.getElementById('loginEmail').value.trim();
+  const email = normalizarEmail(document.getElementById('loginEmail').value);
   const pass = document.getElementById('loginPass').value;
   const btn = document.getElementById('loginBtn');
   errorEl.textContent = '';
   btn.disabled = true; btn.textContent = 'Ingresando...';
+  // Se recuerda en memoria (solo durante este inicio de sesión) para poder guardar/recuperar el
+  // accessPass del alumno si todavía no lo tiene (necesario para su QR/link de acceso).
+  passLoginManual = pass;
   try{
     await window.fb.signInWithEmailAndPassword(window.fb.auth, email, pass);
     // el resto (decidir admin/alumno y entrar) lo maneja onAuthStateChanged
   }catch(err){
+    passLoginManual = null;
     errorEl.textContent = mapAuthError(err.code);
   }finally{
     btn.disabled = false; btn.textContent = 'Ingresar';
@@ -2134,7 +2182,7 @@ async function handleRegistro(event){
   const errorEl = document.getElementById('regError');
   if(!window.fb){ errorEl.textContent = 'Todavía no se conectó con el servidor. Esperá unos segundos y probá de nuevo.'; return false; }
   const nombre = document.getElementById('regNombre').value.trim();
-  const email = document.getElementById('regEmail').value.trim();
+  const email = normalizarEmail(document.getElementById('regEmail').value);
   const pass = document.getElementById('regPass').value;
   const pass2 = document.getElementById('regPass2').value;
   const msgEl = document.getElementById('regMsg');
@@ -2150,6 +2198,9 @@ async function handleRegistro(event){
     // Solo se crea la CUENTA DE ACCESO acá (email/contraseña en Firebase Authentication).
     // El PERFIL en Firestore (users/{uid}) recién se crea al terminar el onboarding,
     // con todos los datos completos — no antes.
+    // La contraseña se guarda en memoria hasta el onboarding para persistirla como accessPass
+    // (el QR/link de acceso automático la necesita, igual que en los alumnos creados por el admin).
+    passRegistroPendiente = pass;
     const cred = await Promise.race([
       window.fb.createUserWithEmailAndPassword(window.fb.auth, email, pass),
       timeout
@@ -2158,6 +2209,7 @@ async function handleRegistro(event){
     justSignedUp = true;
     // el resto (onboarding y entrar como alumno) lo maneja onAuthStateChanged
   }catch(err){
+    passRegistroPendiente = null;
     errorEl.textContent = err.code === 'timeout'
       ? 'La conexión está muy lenta y no pudimos crear la cuenta. Revisá tu wifi/datos e intentá de nuevo.'
       : mapAuthError(err.code);
@@ -2180,6 +2232,30 @@ function mapAuthError(code){
 
 let pendingOnboardingUser = null;
 let justSignedUp = false; // true solo durante el registro recién hecho, no en aperturas posteriores
+let passRegistroPendiente = null; // contraseña del registro recién hecho (solo en memoria) → accessPass
+let passLoginManual = null;       // contraseña del último login manual/link (solo en memoria) → recuperar accessPass
+
+// Completa en Firestore los datos de acceso que le falten a un alumno existente, sin tocar nada más:
+// - role: 'alumno' si no lo tenía (alumnos viejos)
+// - email normalizado (minúsculas)
+// - accessPass: si no tiene, o si el que tiene ya no es su contraseña actual (acaba de entrar con
+//   `passConocida`, así que esa es la válida). Si ya tiene uno correcto, se conserva.
+async function sincronizarDatosAccesoAlumno(user, data, passConocida){
+  if(!user || !data || data.role === 'admin') return {};
+  const updates = {};
+  if(!data.role) updates.role = 'alumno';
+  const emailNorm = normalizarEmail(data.email || user.email);
+  if(emailNorm && data.email !== emailNorm) updates.email = emailNorm;
+  if(passConocida && passConocida.length >= 6 && data.accessPass !== passConocida) updates.accessPass = passConocida;
+  if(!Object.keys(updates).length) return {};
+  try{
+    await window.fb.setDoc(window.fb.doc(window.fb.db, 'users', user.uid), updates, { merge: true });
+    return updates;
+  }catch(err){
+    console.error('No se pudieron completar los datos de acceso del alumno:', err);
+    return {};
+  }
+}
 
 function showOnboardingForm(){
   document.getElementById('formLogin').classList.remove('active');
@@ -2217,16 +2293,43 @@ async function handleOnboarding(event){
   errorEl.textContent = '';
   btn.disabled = true; btn.textContent = 'Guardando...';
   try{
+    // accessPass: si el documento ya tenía uno, se conserva; si no, se usa la contraseña con la que
+    // se acaba de registrar/ingresar. Se guarda ANTES de entrar a la app y se verifica leyendo de vuelta.
+    let accessPassExistente = null;
+    let perfilPrevio = null;
+    try{
+      const prev = await window.fb.getDoc(window.fb.doc(window.fb.db, 'users', user.uid));
+      if(prev.exists()){ perfilPrevio = prev.data() || {}; if(perfilPrevio.accessPass) accessPassExistente = perfilPrevio.accessPass; }
+    }catch(err){
+      // Sin poder leer el perfil previo no se escribe nada (podría pisar plan/rutina de un perfil existente).
+      errorEl.textContent = 'No se pudo verificar tu perfil (' + (err.code || err.message) + '). Revisá la conexión e intentá de nuevo.';
+      btn.disabled = false; btn.textContent = 'Guardar y entrar';
+      return false;
+    }
+    const passParaAcceso = accessPassExistente ? null : (passRegistroPendiente || passLoginManual);
     const profileData = {
-      role: 'alumno', name: user.displayName || 'Alumno', email: user.email,
+      role: 'alumno', name: user.displayName || 'Alumno', email: normalizarEmail(user.email),
       createdAt: new Date().toISOString(),
       age, dni, weight, height, goal, profileCompleted: true,
       joinDate: new Date().toLocaleDateString('es-AR', {month:'2-digit', year:'numeric'}),
       plan: null, membership: 'Pendiente', due: null, amount: 0,
       completion: 0, rutinaActiva: null, weightHistory: [weight], workouts: 0, goalsReached: 0
     };
+    if(passParaAcceso) profileData.accessPass = passParaAcceso;
+    // Si ya existía un documento (perfil incompleto), no se pisan los datos que ya tenía
+    // (plan, monto, rutina, pagos, etc.): solo se completan los del formulario y los faltantes.
+    if(perfilPrevio){
+      const camposDelFormulario = ['age','dni','weight','height','goal','profileCompleted'];
+      Object.keys(profileData).forEach(k => {
+        if(!camposDelFormulario.includes(k) && perfilPrevio[k] !== undefined && perfilPrevio[k] !== null) delete profileData[k];
+      });
+    }
     await window.fb.setDoc(window.fb.doc(window.fb.db, 'users', user.uid), profileData, { merge: true });
     const snap = await window.fb.getDoc(window.fb.doc(window.fb.db, 'users', user.uid));
+    if(!snap.data().accessPass){
+      console.warn('El alumno quedó sin accessPass (se completa en su próximo ingreso con email y contraseña).');
+    }
+    passRegistroPendiente = null; passLoginManual = null;
     currentStudentReal = normalizeStudentData(user.uid, snap.data());
     enterApp('alumno');
   }catch(err){
@@ -2249,9 +2352,56 @@ function addOneMonth(fecha){
   return d;
 }
 
-function computeQuotaStatus(due, frozen){
+// ===== Helpers de email y fechas calendario =====
+// Email siempre en minúsculas y sin espacios (Firebase Auth ya lo trata sin distinguir
+// mayúsculas, así que normalizar no rompe cuentas existentes).
+function normalizarEmail(email){ return String(email || '').trim().toLowerCase(); }
+
+function escapeHTML(texto){
+  return String(texto == null ? '' : texto).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+// Fecha LOCAL en formato YYYY-MM-DD (nunca usar toISOString() para esto: convierte a UTC
+// y en Argentina, de 21 a 24 h, da el día siguiente, o a medianoche UTC, el día anterior).
+function fechaLocalYMD(d){
+  if(!(d instanceof Date) || isNaN(d)) return null;
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+}
+
+// Convierte cualquier formato de fecha guardado en Firestore a un Date LOCAL a las 00:00
+// (fecha calendario). Soporta: 'YYYY-MM-DD', 'DD/MM/YYYY', ISO con hora, Timestamp de
+// Firestore, Date y milisegundos. Devuelve null si no se puede interpretar (nunca inventa fecha).
+function parseFechaCalendario(v){
+  if(v === null || v === undefined || v === '') return null;
+  let d = null;
+  if(v instanceof Date){ d = new Date(v.getTime()); }
+  else if(typeof v === 'object' && typeof v.toDate === 'function'){ d = v.toDate(); }
+  else if(typeof v === 'object' && typeof v.seconds === 'number'){ d = new Date(v.seconds * 1000); }
+  else if(typeof v === 'number'){ d = new Date(v); }
+  else if(typeof v === 'string'){
+    const s = v.trim();
+    let m;
+    if((m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/))){
+      d = new Date(Number(m[1]), Number(m[2])-1, Number(m[3]));
+    }else if((m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/))){
+      d = new Date(Number(m[3]), Number(m[2])-1, Number(m[1]));
+    }else if((m = s.match(/^(\d{4})-(\d{2})-(\d{2})T00:00:00(\.000)?Z$/))){
+      // Formato viejo: una fecha "YYYY-MM-DD" que se guardó con new Date('YYYY-MM-DD').toISOString()
+      // (medianoche UTC). Representa ese día calendario, no el anterior.
+      d = new Date(Number(m[1]), Number(m[2])-1, Number(m[3]));
+    }else{
+      d = new Date(s);
+    }
+  }
+  if(!d || isNaN(d)) return null;
+  d.setHours(0,0,0,0);
+  return d;
+}
+
+function computeQuotaStatus(due, frozen, tienePlan){
   if(frozen) return 'frozen';
-  if(!due) return 'pending';
+  // Sin fecha de vencimiento: si ya tiene plan/monto NO es "sin asignar", es "vencimiento no configurado".
+  if(!due) return tienePlan ? 'nodate' : 'pending';
   const hoy = new Date(); hoy.setHours(0,0,0,0);
   const venc = new Date(due); venc.setHours(0,0,0,0);
   const diffDias = Math.round((venc - hoy) / (1000*60*60*24));
@@ -2294,23 +2444,56 @@ function estimateSessionStats(s, diaKey){
 function normalizeStudentData(uid, data){
   const name = data.name || 'Alumno';
   const initials = name.split(' ').filter(Boolean).slice(0,2).map(w=>w[0].toUpperCase()).join('');
-  const cuotaInicio = data.cuotaInicio ? new Date(data.cuotaInicio) : null;
-  const due = cuotaInicio ? addOneMonth(cuotaInicio) : null;
   const frozen = !!data.frozen;
+  const vencInfo = resolverVencimiento(data);
+  const due = vencInfo.due;
+  const amount = Number(data.amount) || 0;
+  const tienePlan = !!(data.plan && data.plan !== 'Sin asignar') || amount > 0;
+  const rutinaActiva = data.rutinaActiva || null;
   return {
     id: uid, name, initials, color: 'var(--forge)',
+    email: normalizarEmail(data.email), phone: data.telefono || data.phone || '',
+    role: data.role || null,
     age: data.age, dni: data.dni || '', weight: data.weight, height: data.height, goal: data.goal || 'Sin definir',
     joinDate: data.joinDate || '', plan: data.plan || 'Sin asignar',
     membership: frozen ? 'Congelada' : (data.plan ? 'Activa' : 'Pendiente'),
-    quota: computeQuotaStatus(due, frozen), due, cuotaInicio, amount: data.amount || 0,
-    completion: data.completion || 0, rutinaActiva: data.rutinaActiva || null,
+    quota: computeQuotaStatus(due, frozen, tienePlan), due, cuotaInicio: vencInfo.cuotaInicio, amount,
+    vencimientoOrigen: vencInfo.origen,
+    completion: data.completion || 0, rutinaActiva,
     weightHistory: (data.weightHistory && data.weightHistory.length) ? data.weightHistory : [data.weight || 0],
+    weightLog: Array.isArray(data.weightLog) ? data.weightLog : [],
     workouts: data.workouts || 0, goalsReached: data.goalsReached || 0, frozen,
     caloriesTotal: data.caloriesTotal || 0,
-    pagos: data.pagos || [], sessions: data.sessions || [], notifications: data.notifications || [],
+    pagos: Array.isArray(data.pagos) ? data.pagos : [], sessions: data.sessions || [], notifications: data.notifications || [],
     lastSessionDate: data.lastSessionDate || null, routinesWeekStart: data.routinesWeekStart || null,
-    accessPass: data.accessPass || null
+    accessPass: data.accessPass || null,
+    historialPesos: normalizarHistorialPesos(data.historialPesos, rutinaActiva),
+    historialSemanas: Array.isArray(data.historialSemanas) ? data.historialSemanas : [],
+    rutinasAnteriores: Array.isArray(data.rutinasAnteriores) ? data.rutinasAnteriores : []
   };
+}
+
+// Determina el vencimiento de la cuota a partir de los datos que EXISTAN, sin inventar fechas:
+// 1) `vencimiento` (YYYY-MM-DD) explícito, si sigue correspondiendo a la `cuotaInicio` actual
+//    (vencimientoRef guarda con qué cuotaInicio se fijó; si otra versión de la app cambió
+//    cuotaInicio sin tocar vencimiento, se vuelve a calcular desde cuotaInicio).
+// 2) `cuotaInicio` (fecha de pago) + 1 mes.
+// 3) Campo viejo `due`, si existe.
+function resolverVencimiento(data){
+  const cuotaInicio = parseFechaCalendario(data.cuotaInicio);
+  const refCoincide = (data.vencimientoRef === undefined ? null : data.vencimientoRef) === (data.cuotaInicio === undefined ? null : data.cuotaInicio);
+  const vencExplicito = parseFechaCalendario(data.vencimiento);
+  if(vencExplicito && (refCoincide || !cuotaInicio)) return { due: vencExplicito, cuotaInicio, origen: 'vencimiento' };
+  if(cuotaInicio) return { due: addOneMonth(cuotaInicio), cuotaInicio, origen: 'cuotaInicio' };
+  const dueViejo = parseFechaCalendario(data.due);
+  if(dueViejo) return { due: dueViejo, cuotaInicio: null, origen: 'due' };
+  return { due: null, cuotaInicio: null, origen: null };
+}
+
+function fmtVencimiento(s){
+  if(s && s.due) return fmtDate(s.due);
+  if(s && s.quota === 'nodate') return 'Fecha de vencimiento no configurada';
+  return 'Sin definir';
 }
 
 async function logoutFirebase(){
@@ -2460,7 +2643,7 @@ async function registrarIngresoManual(uid){
       window.fb.collection(window.fb.db, 'users', uid, 'checkins'),
       { timestamp: window.fb.serverTimestamp() }
     );
-    resultEl.innerHTML = `<span style="color:#7fbf7f;">✓ Ingreso registrado: ${s.name}</span><div style="margin-top:6px;">${badgeFor(s.quota)} <span style="color:var(--off-dim);">· Vence ${fmtDate(s.due)}</span></div>`;
+    resultEl.innerHTML = `<span style="color:#7fbf7f;">✓ Ingreso registrado: ${s.name}</span><div style="margin-top:6px;">${badgeFor(s.quota)} <span style="color:var(--off-dim);">· Vence ${fmtVencimiento(s)}</span></div>`;
     if(document.getElementById('ingresosListaInicio')) loadIngresos('hoy', 'ingresosListaInicio');
   }catch(err){
     resultEl.innerHTML = `<span style="color:#e0574a;">No se pudo registrar (${err.code || err.message}).</span>`;
@@ -2504,7 +2687,7 @@ async function onScanSuccess(decodedText){
     );
     let cuotaHTML = '';
     if(info){
-      cuotaHTML = `<div style="margin-top:6px;">${badgeFor(info.quota)} <span style="color:var(--off-dim);">· Vence ${fmtDate(info.due)}</span></div>`;
+      cuotaHTML = `<div style="margin-top:6px;">${badgeFor(info.quota)} <span style="color:var(--off-dim);">· Vence ${fmtVencimiento(info)}</span></div>`;
     }
     resultEl.innerHTML = `<span style="color:#7fbf7f;">✓ Ingreso registrado: ${name}</span>${cuotaHTML}`;
     // Refresca en el momento la lista de "ingresaron hoy" de la pantalla de Inicio.
@@ -2541,8 +2724,10 @@ function initAuthListener(){
     if(loader) loader.style.display = 'flex';
     try{
       const { e, p } = JSON.parse(atob(decodeURIComponent(autoLoginToken)));
+      passLoginManual = p;
       // Pequeño delay para asegurar que Firebase ya está listo
-      const hacerLogin = () => window.fb.signInWithEmailAndPassword(window.fb.auth, e, p).catch(err => {
+      const hacerLogin = () => window.fb.signInWithEmailAndPassword(window.fb.auth, normalizarEmail(e), p).catch(err => {
+        passLoginManual = null;
         console.error('No se pudo entrar con el link automático:', err);
         if(loader) loader.style.display = 'none';
         openGate();
@@ -2573,14 +2758,22 @@ function initAuthListener(){
     loadGymAlias();
     let role = 'alumno';
     let data = null;
+    let lecturaPerfilOk = false; // true solo si Firestore respondió (exista o no el documento)
     try{
       const snap = await window.fb.getDoc(window.fb.doc(window.fb.db, 'users', user.uid));
+      lecturaPerfilOk = true;
       if(snap.exists()){ data = snap.data(); if(data.role === 'admin') role = 'admin'; }
     }catch(err){ /* si falla la lectura, entra como alumno por defecto */ }
 
+    if(role === 'admin'){ passLoginManual = null; passRegistroPendiente = null; }
     if(role === 'alumno'){
       if(!data || !data.profileCompleted){
-        if(justSignedUp){
+        // Recién registrado, o alguien que se registró pero no terminó el perfil y ahora entra
+        // a propósito con su email y contraseña: se le muestra el formulario para completarlo
+        // (antes quedaba trabado para siempre: no podía registrarse de nuevo ni ingresar).
+        // Con login manual, SOLO si la lectura del perfil funcionó: si falló (red/permisos) no se
+        // sabe si el perfil existe, y no hay que ofrecer un formulario que podría pisar datos.
+        if(justSignedUp || (passLoginManual && lecturaPerfilOk)){
           pendingOnboardingUser = user;
           document.getElementById('pwaLoading').style.display = 'none';
           showOnboardingForm();
@@ -2593,6 +2786,9 @@ function initAuthListener(){
         if(esAppInstalada) openGate();
         return;
       }
+      const cambiosAcceso = await sincronizarDatosAccesoAlumno(user, data, passLoginManual);
+      passLoginManual = null;
+      data = { ...data, ...cambiosAcceso };
       currentStudentReal = normalizeStudentData(user.uid, data);
       await resetRoutinesIfNewWeek(currentStudentReal);
     }
@@ -2668,7 +2864,17 @@ function limpiarModalHistorialSuelto(){
   if(modalSuelto) modalSuelto.remove();
   const modalQr = document.getElementById('qrAccesoModalDinamico');
   if(modalQr) modalQr.remove();
+  ['detalleCuotaModalDinamico'].forEach(id => { const m = document.getElementById(id); if(m) m.remove(); });
   cerrarQrAmpliado();
+}
+
+// Si un alumno cambia su contraseña, su accessPass (usado por el QR/link de acceso) tiene que acompañarla.
+async function actualizarAccessPassPropio(nueva){
+  if(currentRole !== 'alumno' || !currentStudentReal) return;
+  try{
+    await window.fb.setDoc(window.fb.doc(window.fb.db, 'users', currentStudentReal.id), { accessPass: nueva }, { merge: true });
+    currentStudentReal.accessPass = nueva;
+  }catch(err){ console.error('No se pudo actualizar el accessPass:', err); }
 }
 
 async function cambiarPassword(){
@@ -2679,6 +2885,7 @@ async function cambiarPassword(){
   if(!user){ alert('No hay una sesión activa.'); return; }
   try{
     await window.fb.updatePassword(user, nueva);
+    await actualizarAccessPassPropio(nueva);
     alert('✅ Contraseña cambiada.');
   }catch(err){
     if(err.code === 'auth/requires-recent-login'){
@@ -2689,6 +2896,7 @@ async function cambiarPassword(){
         const cred = window.fb.EmailAuthProvider.credential(user.email, passActual);
         await window.fb.reauthenticateWithCredential(user, cred);
         await window.fb.updatePassword(user, nueva);
+        await actualizarAccessPassPropio(nueva);
         alert('✅ Contraseña cambiada.');
       }catch(err2){
         alert('No se pudo cambiar la contraseña: ' + (err2.code || err2.message));
@@ -2760,6 +2968,66 @@ window.addEventListener('popstate', (e) => {
     showView(fallback);
   }
 });
+
+// ===== MANTENIMIENTO / NORMALIZACIÓN DE DATOS EXISTENTES (explícito, lo dispara el admin) =====
+// Solo AGREGA o corrige campos puntuales con merge; nunca borra campos ni historial.
+let normalizacionPendiente = null; // [{ id, nombre, updates }]
+
+async function revisarDatosExistentes(){
+  const el = document.getElementById('mantenimientoResultado');
+  el.innerHTML = 'Revisando...';
+  let docs;
+  try{ docs = await obtenerDocsAlumnos(); }
+  catch(err){ el.innerHTML = `<span style="color:#e0574a;">No se pudieron leer los alumnos (${escapeHTML(err.code || err.message)}).</span>`; return; }
+  const cambios = [];
+  const sinAccessPass = [], sinRole = [], emailsANormalizar = [], vencimientosViejos = [], sinFechaConPlan = [];
+  docs.forEach((data, id) => {
+    const updates = {};
+    const nombre = data.name || data.email || id;
+    if(!data.role){ updates.role = 'alumno'; sinRole.push(nombre); }
+    if(data.email && data.email !== normalizarEmail(data.email)){ updates.email = normalizarEmail(data.email); emailsANormalizar.push(nombre); }
+    // Vencimiento: se deja explícito en YYYY-MM-DD (a partir de los datos existentes, sin inventar).
+    // cuotaInicio no se toca.
+    if(!data.vencimiento){
+      const info = resolverVencimiento(data);
+      if(info.due){
+        updates.vencimiento = fechaLocalYMD(info.due);
+        updates.vencimientoRef = data.cuotaInicio === undefined ? null : data.cuotaInicio;
+        vencimientosViejos.push(nombre);
+      }else if((data.plan && data.plan !== 'Sin asignar') || Number(data.amount) > 0){
+        sinFechaConPlan.push(nombre);
+      }
+    }
+    if(!data.accessPass) sinAccessPass.push(nombre);
+    if(Object.keys(updates).length) cambios.push({ id, nombre, updates });
+  });
+  normalizacionPendiente = cambios;
+  const lista = (arr) => arr.length ? `<div style="color:var(--off-dim);font-size:.76rem;margin:2px 0 8px 10px;">${arr.slice(0,15).map(escapeHTML).join(', ')}${arr.length > 15 ? ` y ${arr.length-15} más` : ''}</div>` : '';
+  el.innerHTML = `
+    <p style="margin-bottom:8px;">${docs.size} alumno${docs.size===1?'':'s'} revisado${docs.size===1?'':'s'}.</p>
+    <div>• Sin campo <code>role</code> (se les pone "alumno"): <strong>${sinRole.length}</strong></div>${lista(sinRole)}
+    <div>• Email con mayúsculas/espacios (se pasa a minúsculas): <strong>${emailsANormalizar.length}</strong></div>${lista(emailsANormalizar)}
+    <div>• Vencimiento en formato viejo (se guarda como fecha YYYY-MM-DD): <strong>${vencimientosViejos.length}</strong></div>${lista(vencimientosViejos)}
+    <div>• Con plan pero sin fecha de vencimiento (hay que cargarla a mano en su perfil): <strong>${sinFechaConPlan.length}</strong></div>${lista(sinFechaConPlan)}
+    <div>• Sin accessPass / QR de acceso (se completa solo cuando ingresan con email y contraseña; no se puede generar desde acá sin cambiarles la contraseña): <strong>${sinAccessPass.length}</strong></div>${lista(sinAccessPass)}
+    <p style="font-size:.76rem;color:var(--off-dim);margin:8px 0;">El historial de pesos de rutinas viejas no necesita migración: el último peso de cada ejercicio se conserva y el historial con fecha empieza a guardarse desde ahora.</p>
+    ${cambios.length ? `<button type="button" class="btn btn-solid btn-small" onclick="aplicarNormalizacionDatos()">Aplicar correcciones (${cambios.length} alumno${cambios.length===1?'':'s'})</button>` : '<p style="color:var(--ok);">✓ No hay correcciones automáticas pendientes.</p>'}`;
+}
+
+async function aplicarNormalizacionDatos(){
+  if(!normalizacionPendiente || !normalizacionPendiente.length) return;
+  if(!confirm(`Se van a actualizar ${normalizacionPendiente.length} alumno(s). Solo se agregan/corrigen esos campos; no se borra nada. ¿Continuar?`)) return;
+  const el = document.getElementById('mantenimientoResultado');
+  let ok = 0; const errores = [];
+  for(const c of normalizacionPendiente){
+    try{ await window.fb.setDoc(window.fb.doc(window.fb.db, 'users', c.id), c.updates, { merge: true }); ok++; }
+    catch(err){ errores.push(`${c.nombre}: ${err.code || err.message}`); }
+  }
+  normalizacionPendiente = null;
+  el.innerHTML = `<p style="color:var(--ok);">✓ ${ok} alumno(s) actualizados.</p>` +
+    (errores.length ? `<p style="color:#e0574a;">Errores (${errores.length}): ${errores.map(escapeHTML).join('; ')}</p>` : '');
+  await loadAlumnosReales();
+}
 
 function renderConfigPagos(){
   renderAliasForm();
@@ -2883,21 +3151,184 @@ function openProfile(uid){
 function renderDashboard(){
   const list = ALUMNOS_REALES;
   const activos = list.filter(s=>s.membership==='Activa').length;
-  const ingresos = list.reduce((a,s)=>a + (s.quota==='ok' || s.quota==='warn' ? (s.amount||0) : 0), 0);
   const mesActual = new Date().toLocaleDateString('es-AR', {month:'2-digit', year:'numeric'});
   const nuevos = list.filter(s => s.joinDate === mesActual).length;
   document.getElementById('kpiActivos').textContent = activos;
   document.getElementById('kpiNuevos').textContent = nuevos;
-  document.getElementById('kpiIngresos').textContent = fmtMoney(ingresos);
+  renderKpisFinancieros();
   document.getElementById('kpiPagadas').textContent = list.filter(s=>s.quota==='ok').length;
   document.getElementById('kpiProximas').textContent = list.filter(s=>s.quota==='warn').length;
   document.getElementById('kpiVencidas').textContent = list.filter(s=>s.quota==='bad').length;
 }
 
+// ===================================================================
+// FINANZAS — fuente única de verdad
+// - Ingresos REALES (cobrados): suma de los pagos registrados en s.pagos[] (nunca depende del
+//   estado actual de la cuota: una cuota que después vence NO resta lo que ya se cobró).
+// - Proyectado: suma de montos de planes activos (lo que se cobraría si todos pagan). No es ingreso.
+// - Pendiente: monto de cuotas vencidas hoy. No es ingreso.
+// - Gastos: guardados en Firestore, en finanzas/{YYYY-MM} → { gastos:[{id,concepto,monto,fecha}], cierre }
+// - Resultado neto = ingresos reales − gastos.
+// ===================================================================
+const FINANZAS_COLECCION = 'finanzas';
+const FINANZAS_CACHE = {};   // 'YYYY-MM' -> { gastos:[], cierre:null|{...}, cargado:true }
+const FINANZAS_ERRORES = {}; // 'YYYY-MM' -> mensaje de error de carga
+
+function fechaPago(p){
+  // Pagos viejos: fecha ISO. Pagos nuevos: además fechaDia (YYYY-MM-DD local).
+  if(p && p.fechaDia) return parseFechaCalendario(p.fechaDia);
+  const d = p && p.fecha ? new Date(p.fecha) : null;
+  return d && !isNaN(d) ? d : null;
+}
+
+async function cargarFinanzasMes(key, forzar){
+  if(FINANZAS_CACHE[key] && !forzar) return FINANZAS_CACHE[key];
+  try{
+    const snap = await window.fb.getDoc(window.fb.doc(window.fb.db, FINANZAS_COLECCION, key));
+    const data = snap.exists() ? snap.data() : {};
+    FINANZAS_CACHE[key] = {
+      gastos: Array.isArray(data.gastos) ? data.gastos : [],
+      cierre: data.cierre || null, cargado: true
+    };
+    delete FINANZAS_ERRORES[key];
+  }catch(err){
+    console.error('No se pudieron cargar las finanzas de ' + key + ':', err);
+    FINANZAS_ERRORES[key] = err.code || err.message || 'error';
+    FINANZAS_CACHE[key] = FINANZAS_CACHE[key] || { gastos: [], cierre: null, cargado: false };
+  }
+  return FINANZAS_CACHE[key];
+}
+
+// Lista todos los meses con finanzas guardadas (para el historial mensual).
+async function cargarTodasLasFinanzas(){
+  try{
+    const snap = await window.fb.getDocs(window.fb.collection(window.fb.db, FINANZAS_COLECCION));
+    snap.forEach(d => {
+      if(!/^\d{4}-\d{2}$/.test(d.id)) return;
+      const data = d.data();
+      FINANZAS_CACHE[d.id] = { gastos: Array.isArray(data.gastos) ? data.gastos : [], cierre: data.cierre || null, cargado: true };
+    });
+    return null;
+  }catch(err){
+    console.error('No se pudo cargar el historial de finanzas:', err);
+    return err.code || err.message || 'error';
+  }
+}
+
+function calcularFinanzasMes(key){
+  const pagos = getTodosLosPagos().filter(p => p.fechaObj && mesKey(p.fechaObj) === key);
+  const cobrado = pagos.reduce((a,p) => a + (Number(p.monto) || 0), 0);
+  const porMetodo = {};
+  pagos.forEach(p => { const m = p.metodo || 'Sin especificar'; porMetodo[m] = (porMetodo[m] || 0) + (Number(p.monto) || 0); });
+  const conPlan = ALUMNOS_REALES.filter(s => !s.frozen && s.plan && s.plan !== 'Sin asignar' && s.amount > 0);
+  const proyectado = conPlan.reduce((a,s) => a + s.amount, 0);
+  const pendienteVencidas = ALUMNOS_REALES.filter(s => s.quota === 'bad').reduce((a,s) => a + (s.amount || 0), 0);
+  const porVencer = ALUMNOS_REALES.filter(s => s.quota === 'warn').reduce((a,s) => a + (s.amount || 0), 0);
+  const fin = FINANZAS_CACHE[key];
+  const gastos = fin ? fin.gastos : [];
+  const totalGastos = gastos.reduce((a,g) => a + (Number(g.monto) || 0), 0);
+  return {
+    key, pagos, cobrado, cantidadPagos: pagos.length, porMetodo,
+    proyectado, pendienteVencidas, porVencer,
+    gastos, totalGastos, gastosCargados: !!(fin && fin.cargado), errorGastos: FINANZAS_ERRORES[key] || null,
+    neto: cobrado - totalGastos, cierre: fin ? fin.cierre : null
+  };
+}
+
+function renderKpisFinancieros(){
+  const key = mesKey(new Date());
+  const f = calcularFinanzasMes(key);
+  const set = (id, v) => { const el = document.getElementById(id); if(el) el.textContent = v; };
+  set('kpiIngresos', fmtMoney(f.cobrado));
+  set('kpiProyectado', fmtMoney(f.proyectado));
+  set('kpiPendiente', fmtMoney(f.pendienteVencidas));
+  set('kpiGastos', fmtMoney(f.totalGastos));
+  set('kpiNeto', fmtMoney(f.neto));
+  const nota = document.getElementById('kpiFinanzasNota');
+  if(nota){
+    nota.textContent = f.errorGastos
+      ? `No se pudieron leer los gastos (${f.errorGastos}). El neto se muestra con gastos en $0.`
+      : (f.gastos.length ? `${f.gastos.length} gasto${f.gastos.length===1?'':'s'} cargado${f.gastos.length===1?'':'s'} este mes · ${f.cantidadPagos} pago${f.cantidadPagos===1?'':'s'} cobrado${f.cantidadPagos===1?'':'s'}.`
+                         : `Sin gastos cargados este mes ($0) · ${f.cantidadPagos} pago${f.cantidadPagos===1?'':'s'} cobrado${f.cantidadPagos===1?'':'s'}.`);
+  }
+  // Los gastos se leen de Firestore la primera vez; al llegar se vuelve a pintar.
+  if(!FINANZAS_CACHE[key] && window.fb && currentRole === 'admin'){
+    cargarFinanzasMes(key).then(() => renderKpisFinancieros());
+  }
+}
+
+async function agregarGastoMes(key){
+  const errorEl = document.getElementById('gastoError');
+  const concepto = (document.getElementById('gastoConcepto').value || '').trim();
+  const montoStr = document.getElementById('gastoMonto').value;
+  const fecha = document.getElementById('gastoFecha').value;
+  errorEl.textContent = '';
+  if(!concepto){ errorEl.textContent = 'Escribí el concepto (ej: Alquiler).'; return; }
+  const r = validarNumeroIngresado(montoStr, 1, 1000000000, '$');
+  if(!r.ok){ errorEl.textContent = 'Monto: ' + r.error; return; }
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(fecha) || fecha.slice(0,7) !== key){ errorEl.textContent = 'Elegí una fecha dentro de ' + mesLabel(key).toLowerCase() + '.'; return; }
+  const btn = document.getElementById('gastoBtn');
+  if(btn){ btn.disabled = true; btn.textContent = 'Guardando...'; }
+  try{
+    const actual = await cargarFinanzasMes(key, true); // se relee para no pisar gastos cargados desde otro dispositivo
+    if(FINANZAS_ERRORES[key]) throw { code: FINANZAS_ERRORES[key] };
+    const gastos = [...actual.gastos, { id: 'g-' + Date.now() + '-' + Math.random().toString(36).slice(2,6), concepto, monto: r.valor, fecha, creadoEn: new Date().toISOString() }];
+    await window.fb.setDoc(window.fb.doc(window.fb.db, FINANZAS_COLECCION, key), { mes: key, gastos, actualizadoEn: new Date().toISOString() }, { merge: true });
+    FINANZAS_CACHE[key].gastos = gastos;
+    showToast('✅ Gasto guardado.', false);
+    refrescarVistasFinanzas(key);
+  }catch(err){
+    errorEl.textContent = 'No se pudo guardar el gasto (' + (err.code || err.message) + ').' + ((err.code === 'permission-denied') ? ' Hay que permitir la colección "finanzas" en las reglas de Firestore.' : '');
+    if(btn){ btn.disabled = false; btn.textContent = 'Agregar gasto'; }
+  }
+}
+
+async function borrarGastoMes(key, gastoId){
+  const actualLocal = FINANZAS_CACHE[key];
+  const g = actualLocal && actualLocal.gastos.find(x => x.id === gastoId);
+  if(!g) return;
+  if(!confirm(`¿Borrar el gasto "${g.concepto}" (${fmtMoney(Number(g.monto)||0)})?`)) return;
+  try{
+    const actual = await cargarFinanzasMes(key, true);
+    const gastos = actual.gastos.filter(x => x.id !== gastoId);
+    await window.fb.setDoc(window.fb.doc(window.fb.db, FINANZAS_COLECCION, key), { mes: key, gastos, actualizadoEn: new Date().toISOString() }, { merge: true });
+    FINANZAS_CACHE[key].gastos = gastos;
+    refrescarVistasFinanzas(key);
+  }catch(err){
+    alert('No se pudo borrar el gasto (' + (err.code || err.message) + ').');
+  }
+}
+
+// Guarda una "foto" del cierre del mes (totales + detalle de pagos). Sirve como respaldo:
+// si más adelante se elimina un alumno, sus pagos de ese mes quedan en el cierre guardado.
+async function guardarCierreMes(key){
+  await cargarFinanzasMes(key, true);
+  const f = calcularFinanzasMes(key);
+  const cierre = {
+    cobrado: f.cobrado, totalGastos: f.totalGastos, neto: f.neto, cantidadPagos: f.cantidadPagos,
+    porMetodo: f.porMetodo, cerradoEn: new Date().toISOString(),
+    pagos: f.pagos.map(p => ({ alumno: p.alumno, monto: Number(p.monto) || 0, metodo: p.metodo || '', plan: p.plan || '', fecha: p.fecha || null }))
+  };
+  try{
+    await window.fb.setDoc(window.fb.doc(window.fb.db, FINANZAS_COLECCION, key), { mes: key, cierre, actualizadoEn: new Date().toISOString() }, { merge: true });
+    FINANZAS_CACHE[key].cierre = cierre;
+    showToast('✅ Cierre de ' + mesLabel(key).toLowerCase() + ' guardado.', false);
+    refrescarVistasFinanzas(key);
+  }catch(err){
+    alert('No se pudo guardar el cierre (' + (err.code || err.message) + ').');
+  }
+}
+
+function refrescarVistasFinanzas(key){
+  renderKpisFinancieros();
+  if(document.getElementById('view-historialMensual').classList.contains('active')) renderHistorialMensual();
+  if(document.getElementById('historialMesModalDinamico')) openHistorialMesModal(key);
+}
+
 function studentRowHTML(s){
-  return `<tr data-name="${s.name.toLowerCase()}">
+  return `<tr data-name="${escapeHTML((s.name + ' ' + (s.email || '')).toLowerCase())}">
     <td><div class="name-cell"><span class="avatar" style="background:${s.color};">${s.initials}</span>${s.name}</div></td>
-    <td>${s.phone || '—'}</td><td>${s.plan}</td><td>${badgeFor(s.quota)}</td><td>${fmtDate(s.due)}</td>
+    <td>${s.phone || '—'}</td><td>${s.plan}</td><td>${badgeFor(s.quota)}</td><td>${fmtVencimiento(s)}</td>
     <td><span class="btn btn-ghost btn-small" onclick="openProfile('${s.id}')">Ver perfil</span></td>
   </tr>`;
 }
@@ -2952,7 +3383,7 @@ async function handleAddStudent(event){
     return false;
   }
   const nombre = document.getElementById('asNombre').value.trim();
-  const email = document.getElementById('asEmail').value.trim();
+  const email = normalizarEmail(document.getElementById('asEmail').value);
   const telefono = document.getElementById('asTel').value.trim();
   const dni = document.getElementById('asDni').value.trim();
   const planNombre = document.getElementById('asPlan').value;
@@ -2967,13 +3398,10 @@ async function handleAddStudent(event){
   const timeout = new Promise((_, reject) => setTimeout(() => reject({ code:'timeout' }), timeoutMs));
   try{
     const uid = await Promise.race([window.fb.crearAlumnoSinDesloguearAdmin(email, pass), timeout]);
-    // La cuota "arranca" un mes antes del vencimiento elegido, para que addOneMonth() dé justo esa fecha.
-    let cuotaInicio = null;
-    if(vencInput){
-      const venc = new Date(vencInput + 'T00:00:00');
-      venc.setMonth(venc.getMonth() - 1);
-      cuotaInicio = venc.toISOString();
-    }
+    // El vencimiento elegido se guarda tal cual como fecha calendario (YYYY-MM-DD): sin
+    // conversiones a UTC ni "restar un mes" (eso corría el día y fallaba con meses cortos).
+    const vencimiento = /^\d{4}-\d{2}-\d{2}$/.test(vencInput) ? vencInput : null;
+    const cuotaInicio = null;
     const edad = Number(document.getElementById('asEdad').value) || 0;
     const peso = Number(document.getElementById('asPeso').value) || 0;
     const altura = Number(document.getElementById('asAltura').value) || 0;
@@ -2983,7 +3411,7 @@ async function handleAddStudent(event){
       createdAt: new Date().toISOString(), profileCompleted: true,
       goal: objetivo, age: edad, weight: peso, height: altura,
       joinDate: new Date().toLocaleDateString('es-AR', {month:'2-digit', year:'numeric'}),
-      plan: planNombre || 'Sin asignar', amount: monto, cuotaInicio, membership: 'Activa',
+      plan: planNombre || 'Sin asignar', amount: monto, cuotaInicio, vencimiento, vencimientoRef: cuotaInicio, membership: 'Activa',
       completion: 0, rutinaActiva: null, weightHistory: peso ? [peso] : [0], workouts: 0, goalsReached: 0,
       caloriesTotal: 0, pagos: [], sessions: [], notifications: [],
       accessPass: pass
@@ -3025,7 +3453,7 @@ function renderCuotasTable(filter){
   }
   document.getElementById('tblCuotas').innerHTML = list.map(s=>`
     <tr><td><div class="name-cell"><span class="avatar" style="background:${s.color};">${s.initials}</span>${s.name}</div></td>
-    <td>${s.plan}</td><td>${fmtMoney(s.amount)}</td><td>${fmtDate(s.due)}</td><td>${badgeFor(s.quota)}</td></tr>`).join('');
+    <td>${s.plan}</td><td>${fmtMoney(s.amount)}</td><td>${fmtVencimiento(s)}</td><td>${badgeFor(s.quota)}</td></tr>`).join('');
 }
 function filterCuotas(f, el){
   document.querySelectorAll('.qtab').forEach(t=>t.classList.remove('active'));
@@ -3196,13 +3624,14 @@ function renderProfile(uid){
         <div class="field-row"><span>Ingreso</span><span>${s.joinDate || '—'}</span></div>
         <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;">
           <span class="btn btn-ghost btn-small" onclick="mostrarEdicionDatosAlumno('${s.id}')">✏️ Editar datos</span>
-          ${s.accessPass ? `<span class="btn btn-ghost btn-small" onclick="mostrarQrAcceso('${s.id}')">📱 Ver QR de acceso</span>` : ''}
+          ${s.accessPass && s.email ? `<span class="btn btn-ghost btn-small" onclick="mostrarQrAcceso('${s.id}')">📱 Ver QR de acceso</span>` : ''}
         </div>
+        ${s.accessPass && s.email ? '' : `<p style="font-size:.74rem;color:var(--off-dim);margin-top:10px;">📱 QR de acceso todavía no disponible${!s.email ? ' (falta el email en su perfil)' : ''}: se activa solo la próxima vez que ${s.name.split(' ')[0]} ingrese con su email y contraseña.</p>`}
       </div>
       <div class="card"><h4>Cuota actual</h4>
         <div class="field-row"><span>Plan</span><span>${s.plan}</span></div>
         <div class="field-row"><span>Monto</span><span>${fmtMoney(s.amount)}</span></div>
-        <div class="field-row"><span>Vencimiento</span><span>${fmtDate(s.due)}</span></div>
+        <div class="field-row"><span>Vencimiento</span><span>${fmtVencimiento(s)}</span></div>
         <div class="field-row"><span>Estado</span><span>${badgeFor(s.quota)}</span></div>
       </div>
       <div class="card"><h4>Cumplimiento</h4>
@@ -3212,17 +3641,19 @@ function renderProfile(uid){
     </div>
     <div class="card" style="margin-bottom:18px;">
       <h4>Asignar plan y cuota</h4>
-      <p style="font-size:.78rem;color:var(--off-dim);margin-bottom:14px;">El vencimiento se calcula solo: exactamente 1 mes después de la fecha de pago. No hace falta calcularlo a mano.</p>
+      <p style="font-size:.78rem;color:var(--off-dim);margin-bottom:14px;">El vencimiento se calcula solo: exactamente 1 mes después de la fecha de pago. Si necesitás otra fecha, podés cargar el vencimiento a mano.</p>
       <form onsubmit="return handleAssignPlan(event, '${s.id}')">
-        <div class="grid grid-3" style="gap:12px;margin-bottom:12px;">
+        <div class="grid grid-2" style="gap:12px;margin-bottom:12px;">
           <div><label style="font-size:.76rem;color:var(--off-dim);display:block;margin-bottom:5px;">Plan</label>
             <select id="editPlan" onchange="handlePlanChange()" style="width:100%;background:var(--black);border:1px solid rgba(242,237,228,.16);border-radius:8px;padding:10px;color:var(--off);">${planOptions}</select></div>
           <div><label style="font-size:.76rem;color:var(--off-dim);display:block;margin-bottom:5px;">Monto</label>
             <input type="number" id="editMonto" value="${s.amount || ''}" style="width:100%;background:var(--black);border:1px solid rgba(242,237,228,.16);border-radius:8px;padding:10px;color:var(--off);"></div>
           <div><label style="font-size:.76rem;color:var(--off-dim);display:block;margin-bottom:5px;">Fecha de pago</label>
-            <input type="date" id="editInicio" value="${s.cuotaInicio ? s.cuotaInicio.toISOString().slice(0,10) : ''}" style="width:100%;background:var(--black);border:1px solid rgba(242,237,228,.16);border-radius:8px;padding:10px;color:var(--off);"></div>
+            <input type="date" id="editInicio" data-original="${s.cuotaInicio ? fechaLocalYMD(s.cuotaInicio) : ''}" value="${s.cuotaInicio ? fechaLocalYMD(s.cuotaInicio) : ''}" style="width:100%;background:var(--black);border:1px solid rgba(242,237,228,.16);border-radius:8px;padding:10px;color:var(--off);"></div>
+          <div><label style="font-size:.76rem;color:var(--off-dim);display:block;margin-bottom:5px;">Vencimiento</label>
+            <input type="date" id="editVenc" data-original="${s.due ? fechaLocalYMD(s.due) : ''}" value="${s.due ? fechaLocalYMD(s.due) : ''}" style="width:100%;background:var(--black);border:1px solid rgba(242,237,228,.16);border-radius:8px;padding:10px;color:var(--off);"></div>
         </div>
-        ${s.due ? `<p style="font-size:.78rem;color:var(--off-dim);margin-bottom:12px;">Próximo vencimiento calculado: <strong style="color:var(--off);">${fmtDate(s.due)}</strong></p>` : ''}
+        ${s.due ? `<p style="font-size:.78rem;color:var(--off-dim);margin-bottom:12px;">Próximo vencimiento: <strong style="color:var(--off);">${fmtVencimiento(s)}</strong></p>` : (s.quota === 'nodate' ? '<p style="font-size:.78rem;color:var(--warn);margin-bottom:12px;">Fecha de vencimiento no configurada: cargá la fecha de pago o el vencimiento.</p>' : '')}
         <div class="auth-error" id="assignError"></div>
         <div style="display:flex;gap:10px;flex-wrap:wrap;">
           <button type="submit" class="btn btn-solid btn-small">Guardar</button>
@@ -3245,6 +3676,11 @@ function renderProfile(uid){
         <button class="btn btn-solid btn-small" onclick="handleAddRoutine('${s.id}')">${s.rutinaActiva ? '🔄 Cambiar rutina' : '+ Asignar rutina'}</button>
       </div>
       ${!s.rutinaActiva ? '<p style="font-size:.85rem;color:var(--off-dim);">Todavía no tiene una rutina asignada.</p>' : renderRutinaActivaAdmin(s)}
+    </div>
+    <div class="card" style="margin-top:18px;">
+      <h4>Historial de pesos y semanas</h4>
+      <p style="font-size:.78rem;color:var(--off-dim);margin-bottom:12px;">Se conserva aunque cambie la semana o se asigne otra plantilla.</p>
+      ${renderHistorialPesosCompletoAdminHTML(s)}
     </div>
   `;
 }
@@ -3296,10 +3732,15 @@ function renderDiaCardHTML(s, diaKey, isAdmin, ctx){
           return `
           <div style="${esSuperset ? `border-left:4px solid ${borde};padding-left:12px;margin-bottom:10px;background:${borde}11;border-radius:0 8px 8px 0;` : ''}">
             ${esSuperset ? `<p style="font-size:.78rem;letter-spacing:.02em;color:${borde};font-weight:700;padding-top:8px;">Superset ${grupo.color.charAt(0).toUpperCase()+grupo.color.slice(1)}: ${grupo.items.map(it=>it.e.nombre).join(' + ')} — Hacer alternado</p>` : ''}
-            ${grupo.items.map(({e,ei}) => { const videoMostrar = e.videoOverride || e.video || getVideoDelBanco(e.nombre); return `
+            ${grupo.items.map(({e,ei}) => { const videoMostrar = e.videoOverride || e.video || getVideoDelBanco(e.nombre);
+              const histEj = getHistorialPeso(s, e.nombre);
+              const ultReg = histEj.length ? histEj[histEj.length-1] : null;
+              // El alumno ve su último peso registrado (con fecha) como referencia, también después del reset semanal.
+              const pesoInfo = ultReg ? ` · última vez: ${fmtPeso(ultReg.peso)} (${fmtFechaCorta(ultReg.fecha)})` : (e.peso ? ` · ${e.peso}kg sugerido` : '');
+              return `
               <div style="padding:14px 0;border-bottom:1px solid rgba(242,237,228,.12);">
                 <div class="exercise" style="border:none;padding:0;">
-                  <div class="info"><h5>${e.nombre}</h5><span>${e.series} series × ${e.reps}${e.peso ? ` · ${e.peso}kg sugerido` : ''}</span></div>
+                  <div class="info"><h5>${e.nombre}</h5><span>${e.series} series × ${e.reps}${isAdmin ? (e.peso && !ultReg ? ` · ${e.peso}kg sugerido` : '') : pesoInfo}</span></div>
                   <div class="status" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
                     ${videoMostrar ? `<a href="${videoMostrar}" target="_blank" rel="noopener" style="font-size:.76rem;color:${color};font-weight:600;">▶ Ver video</a>` : ''}
                     ${isAdmin ? (e.done ? '<span class="badge ok">Completado</span>' : '<span class="badge warn">Pendiente</span>') : `
@@ -3309,6 +3750,7 @@ function renderDiaCardHTML(s, diaKey, isAdmin, ctx){
                     `}
                   </div>
                 </div>
+                ${isAdmin ? renderHistorialPesoAdminHTML(s, e) : ''}
                 ${isAdmin ? `
                   <div style="display:flex;align-items:center;gap:18px;margin-top:10px;padding-top:8px;border-top:1px dashed rgba(242,237,228,.10);flex-wrap:wrap;">
                     <span style="font-size:.74rem;color:var(--forge);font-weight:600;cursor:pointer;" onclick="handleSetVideo('${s.id}','${diaKey}',${ei})" title="Poné un video distinto solo para este alumno">${e.videoOverride ? '✎ Editar video (solo este alumno)' : '+ Video distinto para este alumno'}</span>
@@ -3331,24 +3773,197 @@ function getMondayISO(date){
   d.setHours(0,0,0,0);
   const diff = (d.getDay() + 6) % 7; // días desde el lunes
   d.setDate(d.getDate() - diff);
-  return d.toISOString().slice(0,10);
+  return fechaLocalYMD(d); // fecha local (antes toISOString podía correr el día según la zona horaria)
+}
+
+// ===== HISTORIAL DE PESOS POR EJERCICIO =====
+// Se guarda FUERA de rutinaActiva, en users/{uid}.historialPesos, como un mapa:
+//   { [claveEjercicio]: [ { peso, fecha:'YYYY-MM-DD', ts, semana:'YYYY-MM-DD'(lunes), ejercicio, rutina, dia }, ... ] }
+// La clave es el nombre del ejercicio normalizado, así el historial sobrevive a resets semanales
+// y a cambios de plantilla (si la rutina nueva vuelve a tener "Press banca", sigue el mismo historial).
+// En cada ejercicio de rutinaActiva se sigue guardando `peso` (último peso) para mostrarlo rápido.
+// Límite por ejercicio para que el documento del alumno no se acerque al máximo de 1 MB de Firestore
+// (60 registros ≈ más de un año entrenando ese ejercicio una vez por semana).
+const MAX_REGISTROS_PESO_POR_EJERCICIO = 60;
+
+function claveEjercicio(nombre){
+  const base = quitarAcentos(String(nombre || '').trim().toLowerCase()).replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+  return base || 'ejercicio';
+}
+
+// Compatibilidad: si algún ejercicio viejo trae su propio array `historialPeso`, se incorpora
+// al mapa (sin duplicar) en vez de perderlo o sobrescribirlo.
+function normalizarHistorialPesos(historial, rutinaActiva){
+  const mapa = {};
+  if(historial && typeof historial === 'object'){
+    Object.keys(historial).forEach(k => {
+      if(Array.isArray(historial[k])) mapa[k] = historial[k].filter(r => r && isFinite(Number(r.peso)));
+    });
+  }
+  if(rutinaActiva && rutinaActiva.dias){
+    Object.keys(rutinaActiva.dias).forEach(dk => {
+      ((rutinaActiva.dias[dk] || {}).ejercicios || []).forEach(e => {
+        if(!e || !Array.isArray(e.historialPeso) || !e.historialPeso.length) return;
+        const k = claveEjercicio(e.nombre);
+        const lista = mapa[k] = mapa[k] || [];
+        e.historialPeso.forEach(r => {
+          if(!r || !isFinite(Number(r.peso))) return;
+          const fecha = fechaLocalYMD(parseFechaCalendario(r.fecha)) || null;
+          const dup = lista.some(x => Number(x.peso) === Number(r.peso) && (x.fecha || null) === fecha);
+          if(!dup) lista.push({ peso: Number(r.peso), fecha, ts: r.ts || null, semana: r.semana || (fecha ? getMondayISO(parseFechaCalendario(fecha)) : null), ejercicio: e.nombre });
+        });
+      });
+    });
+  }
+  Object.keys(mapa).forEach(k => mapa[k].sort((a,b) => String(a.ts || a.fecha || '').localeCompare(String(b.ts || b.fecha || ''))));
+  return mapa;
+}
+
+function getHistorialPeso(s, nombreEjercicio){
+  const h = s && s.historialPesos ? s.historialPesos[claveEjercicio(nombreEjercicio)] : null;
+  return Array.isArray(h) ? h : [];
+}
+
+// Agrega (o reemplaza, si es el mismo ejercicio del mismo día de rutina en la misma fecha) un registro.
+// Devuelve { clave, lista } para guardar solo esa clave en Firestore.
+function registrarPesoEnHistorial(s, ex, diaKey, peso){
+  const clave = claveEjercicio(ex.nombre);
+  s.historialPesos = s.historialPesos || {};
+  const hoy = new Date();
+  const fecha = fechaLocalYMD(hoy);
+  const dia = s.rutinaActiva && s.rutinaActiva.dias[diaKey];
+  const registro = {
+    peso: Number(peso), fecha, ts: hoy.toISOString(), semana: getMondayISO(hoy),
+    ejercicio: ex.nombre, rutina: s.rutinaActiva ? s.rutinaActiva.nombre : '', dia: dia ? dia.nombre : '', diaKey
+  };
+  const lista = (s.historialPesos[clave] || []).filter(r => !(r.fecha === fecha && r.diaKey === diaKey));
+  lista.push(registro);
+  s.historialPesos[clave] = lista.slice(-MAX_REGISTROS_PESO_POR_EJERCICIO);
+  return { clave, lista: s.historialPesos[clave] };
+}
+
+function fmtPeso(n){
+  const v = Number(n);
+  if(!isFinite(v)) return '—';
+  return (Math.round(v * 100) / 100).toLocaleString('es-AR') + ' kg';
+}
+function fmtFechaCorta(ymd){
+  const d = parseFechaCalendario(ymd);
+  return d ? d.toLocaleDateString('es-AR') : 'sin fecha';
+}
+
+// Texto de progresión entre el último registro y el anterior.
+function progresionPesoHTML(lista){
+  if(lista.length < 2) return '<span style="color:var(--off-dim);">Primer registro</span>';
+  const ult = Number(lista[lista.length-1].peso), ant = Number(lista[lista.length-2].peso);
+  const diff = Math.round((ult - ant) * 100) / 100;
+  if(diff > 0) return `<span style="color:var(--ok);font-weight:600;">▲ +${diff.toLocaleString('es-AR')} kg vs. anterior</span>`;
+  if(diff < 0) return `<span style="color:var(--bad);font-weight:600;">▼ ${diff.toLocaleString('es-AR')} kg vs. anterior</span>`;
+  return '<span style="color:var(--off-dim);">= Igual que el anterior</span>';
+}
+
+// Bloque de historial para la vista del ADMIN (fácil de leer en celular: lista vertical + desplegable).
+function renderHistorialPesoAdminHTML(s, e){
+  const lista = getHistorialPeso(s, e.nombre);
+  if(!lista.length){
+    return `<div style="font-size:.78rem;color:var(--off-dim);margin-top:8px;">
+      ${e.peso ? `Último / sugerido: <strong style="color:var(--off);">${fmtPeso(e.peso)}</strong> · ` : ''}Todavía no hay pesos registrados con fecha.
+    </div>`;
+  }
+  const ult = lista[lista.length-1];
+  const recientes = lista.slice().reverse();
+  return `
+    <div style="margin-top:8px;font-size:.8rem;">
+      <div style="display:flex;flex-wrap:wrap;gap:6px 14px;align-items:baseline;">
+        <span>Último: <strong style="color:var(--off);font-size:.9rem;">${fmtPeso(ult.peso)}</strong> <span style="color:var(--off-dim);">(${fmtFechaCorta(ult.fecha)})</span></span>
+        ${progresionPesoHTML(lista)}
+      </div>
+      <details style="margin-top:6px;">
+        <summary style="cursor:pointer;color:var(--forge);font-weight:600;font-size:.76rem;">Ver historial (${lista.length} registro${lista.length===1?'':'s'})</summary>
+        <div style="margin-top:6px;display:flex;flex-direction:column;gap:2px;">
+          ${recientes.map((r, i) => {
+            const previo = recientes[i+1];
+            const flecha = previo ? (Number(r.peso) > Number(previo.peso) ? ' <span style="color:var(--ok);">▲</span>' : Number(r.peso) < Number(previo.peso) ? ' <span style="color:var(--bad);">▼</span>' : '') : '';
+            return `<div style="display:flex;justify-content:space-between;gap:10px;padding:4px 0;border-bottom:1px solid rgba(242,237,228,.06);">
+              <span><strong>${fmtPeso(r.peso)}</strong>${flecha}</span>
+              <span style="color:var(--off-dim);text-align:right;">${fmtFechaCorta(r.fecha)}${r.semana ? ` · sem. del ${fmtFechaCorta(r.semana)}` : ''}</span>
+            </div>`;
+          }).join('')}
+        </div>
+      </details>
+    </div>`;
+}
+
+// Resumen de TODO el historial de pesos del alumno (incluye ejercicios que ya no están en la rutina actual).
+function renderHistorialPesosCompletoAdminHTML(s){
+  const claves = Object.keys(s.historialPesos || {}).filter(k => (s.historialPesos[k] || []).length);
+  const semanas = (s.historialSemanas || []).slice(-8).reverse();
+  const anteriores = (s.rutinasAnteriores || []).slice().reverse();
+  if(!claves.length && !semanas.length && !anteriores.length){
+    return '<p style="font-size:.85rem;color:var(--off-dim);">Todavía no hay registros históricos. Se van a ir guardando a medida que el alumno marque ejercicios con el peso usado.</p>';
+  }
+  const enRutina = new Set();
+  if(s.rutinaActiva) ordenarClavesDias(s.rutinaActiva.dias).forEach(dk => (s.rutinaActiva.dias[dk].ejercicios || []).forEach(e => enRutina.add(claveEjercicio(e.nombre))));
+  const filas = claves.map(k => {
+    const lista = s.historialPesos[k];
+    const ult = lista[lista.length-1];
+    return { k, lista, ult, nombre: ult.ejercicio || k };
+  }).sort((a,b) => String(b.ult.ts || b.ult.fecha || '').localeCompare(String(a.ult.ts || a.ult.fecha || '')));
+  return `
+    ${filas.length ? `<div style="display:flex;flex-direction:column;gap:10px;">
+      ${filas.map(f => `
+        <div style="background:rgba(255,255,255,.03);border-radius:8px;padding:10px 12px;">
+          <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;">
+            <strong style="font-size:.88rem;">${escapeHTML(f.nombre)}</strong>
+            ${enRutina.has(f.k) ? '' : '<span style="font-size:.7rem;color:var(--off-dim);">(no está en la rutina actual)</span>'}
+          </div>
+          ${renderHistorialPesoAdminHTML(s, { nombre: f.nombre })}
+        </div>`).join('')}
+    </div>` : ''}
+    ${semanas.length ? `
+      <h5 style="margin:16px 0 8px;font-size:.85rem;">Semanas anteriores</h5>
+      ${semanas.map(w => `<div class="field-row"><span>${w.semana ? 'Semana del ' + fmtFechaCorta(w.semana) : 'Semana anterior (sin fecha)'} · ${escapeHTML(w.rutina || '')}</span><span>${w.hechos || 0}/${w.total || 0} ejercicios · ${w.completion || 0}%</span></div>`).join('')}` : ''}
+    ${anteriores.length ? `
+      <h5 style="margin:16px 0 8px;font-size:.85rem;">Rutinas anteriores</h5>
+      ${anteriores.map(r => `<div class="field-row"><span>${escapeHTML(r.nombre || 'Rutina')}</span><span>reemplazada el ${fmtFechaCorta(r.reemplazadaEl)}</span></div>`).join('')}` : ''}`;
 }
 
 // Si arrancó una semana nueva desde la última vez que se guardó, desmarca los ejercicios
 // para que el alumno pueda volver a completar la misma rutina esta semana.
+// NO toca los pesos: se conserva `peso` (último peso) en cada ejercicio y el historial completo
+// (historialPesos) vive fuera de la rutina. Antes de desmarcar, guarda un resumen de la semana
+// anterior en historialSemanas.
 // Devuelve true si hubo que resetear (y guardar en Firestore).
 async function resetRoutinesIfNewWeek(s){
   const mondayActual = getMondayISO(new Date());
   if(s.routinesWeekStart === mondayActual) return false;
   if(!s.rutinaActiva){ s.routinesWeekStart = mondayActual; return false; }
-  ordenarClavesDias(s.rutinaActiva.dias).forEach(dk => {
-    s.rutinaActiva.dias[dk].ejercicios.forEach(e => { e.done = false; });
+  const claves = ordenarClavesDias(s.rutinaActiva.dias);
+  let total = 0, hechos = 0;
+  const dias = claves.map(dk => {
+    const dia = s.rutinaActiva.dias[dk];
+    const ejercicios = dia.ejercicios || [];
+    const hechosDia = ejercicios.filter(e => e.done);
+    total += ejercicios.length; hechos += hechosDia.length;
+    return { diaKey: dk, dia: dia.nombre, hechos: hechosDia.length, total: ejercicios.length, ejerciciosHechos: hechosDia.map(e => e.nombre) };
+  });
+  const updates = {};
+  if(s.routinesWeekStart || hechos > 0){
+    const resumen = {
+      semana: s.routinesWeekStart || null, cerradaEl: fechaLocalYMD(new Date()),
+      rutina: s.rutinaActiva.nombre || '', completion: s.completion || 0, hechos, total, dias
+    };
+    s.historialSemanas = [...(s.historialSemanas || []).filter(h => !resumen.semana || h.semana !== resumen.semana), resumen].slice(-52);
+    updates.historialSemanas = s.historialSemanas;
+  }
+  claves.forEach(dk => {
+    (s.rutinaActiva.dias[dk].ejercicios || []).forEach(e => { e.done = false; });
   });
   s.completion = 0;
   s.routinesWeekStart = mondayActual;
   try{
     await window.fb.setDoc(window.fb.doc(window.fb.db, 'users', s.id), {
-      rutinaActiva: s.rutinaActiva, completion: s.completion, routinesWeekStart: s.routinesWeekStart
+      rutinaActiva: s.rutinaActiva, completion: s.completion, routinesWeekStart: s.routinesWeekStart, ...updates
     }, { merge: true });
   }catch(err){ console.error('No se pudo resetear la rutina semanal:', err); }
   return true;
@@ -3549,7 +4164,7 @@ async function confirmarAsignarPlantilla(){
   const p = RUTINAS_PLANTILLAS[key];
   const s = ALUMNOS_REALES.find(a => a.id === uid);
   if(!uid || !p || !s){ errorEl.textContent = 'No se pudo identificar el alumno o la plantilla.'; return; }
-  const confirmar = confirm(`¿Reemplazar la rutina actual de ${s.name} por "${p.nombre}"?`);
+  const confirmar = confirm(`¿Reemplazar la rutina actual de ${s.name} por "${p.nombre}"?\n\nEl historial de pesos y de semanas anteriores del alumno se conserva.`);
   if(!confirmar) return;
 
   // Clonamos la plantilla completa (con ids únicos por instancia y "done" en false) para el alumno.
@@ -3557,9 +4172,43 @@ async function confirmarAsignarPlantilla(){
   ordenarClavesDias(clon.dias).forEach(dk => {
     clon.dias[dk].ejercicios = clon.dias[dk].ejercicios.map(e => ({ ...e, done: false, videoOverride: null }));
   });
+  // La rutina anterior se archiva (no se pierde). El historial de pesos vive aparte
+  // (historialPesos), así que no se toca: si la nueva rutina repite ejercicios, sigue su historial.
+  const payload = { rutinaActiva: clon };
+  if(s.rutinaActiva){
+    const archivada = {
+      nombre: s.rutinaActiva.nombre || 'Rutina', reemplazadaEl: fechaLocalYMD(new Date()),
+      semana: s.routinesWeekStart || null, completion: s.completion || 0,
+      rutina: JSON.parse(JSON.stringify(s.rutinaActiva))
+    };
+    payload.rutinasAnteriores = [...(s.rutinasAnteriores || []), archivada].slice(-5);
+  }
+  // Historial viejo guardado DENTRO de los ejercicios (historialPeso): hay que pasarlo a historialPesos
+  // antes de reemplazar la rutina. NO se usa la copia en memoria del admin (puede estar desactualizada y
+  // pisaría pesos que el alumno registró después): se relee el documento y se escriben SOLO las claves
+  // que ganan registros viejos, unidas con lo que ya está guardado en Firestore.
+  let historialFresco;
   try{
-    await window.fb.setDoc(window.fb.doc(window.fb.db, 'users', uid), { rutinaActiva: clon }, { merge: true });
+    const snap = await window.fb.getDoc(window.fb.doc(window.fb.db, 'users', uid));
+    const actual = snap.exists() ? snap.data() : {};
+    const guardado = (actual.historialPesos && typeof actual.historialPesos === 'object') ? actual.historialPesos : {};
+    historialFresco = normalizarHistorialPesos(guardado, actual.rutinaActiva || null);
+    const clavesConRegistrosViejos = Object.keys(historialFresco).filter(k =>
+      historialFresco[k].length > (Array.isArray(guardado[k]) ? guardado[k].length : 0));
+    if(clavesConRegistrosViejos.length){
+      payload.historialPesos = {};
+      clavesConRegistrosViejos.forEach(k => { payload.historialPesos[k] = historialFresco[k].slice(-MAX_REGISTROS_PESO_POR_EJERCICIO); });
+    }
+  }catch(err){
+    // Sin poder leer el estado actual no se reemplaza la rutina (evita perder historial).
+    errorEl.textContent = 'No se pudo verificar el historial del alumno (' + (err.code || err.message) + '). No se cambió la rutina.';
+    return;
+  }
+  try{
+    await window.fb.setDoc(window.fb.doc(window.fb.db, 'users', uid), payload, { merge: true });
+    s.historialPesos = historialFresco;
     s.rutinaActiva = clon;
+    if(payload.rutinasAnteriores) s.rutinasAnteriores = payload.rutinasAnteriores;
     document.getElementById('assignRoutineModal').classList.remove('active');
     addRoutineCtx = null;
     renderProfile(uid);
@@ -4078,12 +4727,26 @@ async function handleAssignPlan(event, uid){
   const errorEl = document.getElementById('assignError');
   const plan = document.getElementById('editPlan').value;
   const amount = Number(document.getElementById('editMonto').value) || 0;
-  const inicioStr = document.getElementById('editInicio').value;
+  const inicioEl = document.getElementById('editInicio');
+  const vencEl = document.getElementById('editVenc');
+  const inicioStr = inicioEl.value; // YYYY-MM-DD (fecha calendario, se guarda tal cual, sin pasar por UTC)
+  const vencStr = vencEl ? vencEl.value : '';
+  const inicioCambio = inicioStr !== (inicioEl.dataset.original || '');
+  const vencCambio = vencEl ? vencStr !== (vencEl.dataset.original || '') : false;
   errorEl.textContent = '';
+  // Si el admin tocó el vencimiento, manda esa fecha. Si solo cambió la fecha de pago, se recalcula
+  // (+1 mes). Si no tocó ninguna, se conserva el vencimiento que ya tenía.
+  let vencimiento;
+  if(vencCambio) vencimiento = vencStr || null;
+  else if(inicioCambio) vencimiento = inicioStr ? fechaLocalYMD(addOneMonth(parseFechaCalendario(inicioStr))) : null;
+  else vencimiento = vencStr || null;
+  const s = ALUMNOS_REALES.find(a => a.id === uid);
+  const cuotaInicio = inicioCambio ? (inicioStr || null)
+    : (s && s.cuotaInicio ? fechaLocalYMD(s.cuotaInicio) : null);
   try{
     await window.fb.setDoc(window.fb.doc(window.fb.db, 'users', uid), {
       plan, amount,
-      cuotaInicio: inicioStr ? new Date(inicioStr).toISOString() : null,
+      cuotaInicio, vencimiento, vencimientoRef: cuotaInicio,
       membership: 'Activa'
     }, { merge: true });
     await loadAlumnosReales();
@@ -4110,13 +4773,18 @@ async function handleRenovarCuota(uid){
   if(!metodo) return;
   try{
     const DESCUENTO_EFECTIVO = 2000;
-    const hoyISO = new Date().toISOString();
+    const ahora = new Date();
+    const hoyISO = ahora.toISOString(); // momento exacto del pago (para ordenar y agrupar por mes)
+    const hoyYMD = fechaLocalYMD(ahora); // fecha calendario local
+    const vencimiento = fechaLocalYMD(addOneMonth(parseFechaCalendario(hoyYMD)));
     const precioLista = s.amount || 0;
     const descuentoAplicado = metodo === 'Efectivo' ? Math.min(DESCUENTO_EFECTIVO, precioLista) : 0;
     const montoCobrado = precioLista - descuentoAplicado;
     const pagos = (s.pagos || []).slice(-99);
-    pagos.push({ monto: montoCobrado, metodo, plan: s.plan, fecha: hoyISO, precio_lista: precioLista, descuento_aplicado: descuentoAplicado });
-    await window.fb.setDoc(window.fb.doc(window.fb.db, 'users', uid), { cuotaInicio: hoyISO, membership: 'Activa', pagos }, { merge: true });
+    pagos.push({ monto: montoCobrado, metodo, plan: s.plan, fecha: hoyISO, fechaDia: hoyYMD, precio_lista: precioLista, descuento_aplicado: descuentoAplicado, vencimientoHasta: vencimiento });
+    await window.fb.setDoc(window.fb.doc(window.fb.db, 'users', uid), {
+      cuotaInicio: hoyYMD, vencimiento, vencimientoRef: hoyYMD, membership: 'Activa', pagos
+    }, { merge: true });
     await loadAlumnosReales();
     renderProfile(uid);
   }catch(err){
@@ -4148,9 +4816,13 @@ async function handleCancelMembership(uid){
   }
 }
 
-function handleDownloadResumen(){
+async function handleDownloadResumen(keyParam){
   const list = ALUMNOS_REALES;
-  const totalFacturable = list.reduce((a,s)=>a + (s.amount||0), 0);
+  const key = (typeof keyParam === 'string' && /^\d{4}-\d{2}$/.test(keyParam)) ? keyParam : mesKey(new Date());
+  await cargarFinanzasMes(key, true); // usa los gastos GUARDADOS (sin prompt)
+  const fin = calcularFinanzasMes(key);
+  const esMesActual = key === mesKey(new Date());
+  const totalFacturable = fin.proyectado;
   const alDia = list.filter(s=>s.quota==='ok').length;
   const vencidas = list.filter(s=>s.quota==='bad').length;
   const porVencer = list.filter(s=>s.quota==='warn').length;
@@ -4159,30 +4831,20 @@ function handleDownloadResumen(){
 
   const hoy = new Date();
   const fechaStr = hoy.toLocaleDateString('es-AR');
-  const mesNombre = hoy.toLocaleDateString('es-AR', {month:'long', year:'numeric'});
-  const mesActual = hoy.toLocaleDateString('es-AR', {month:'2-digit', year:'numeric'});
+  const inicioMes = new Date(Number(key.slice(0,4)), Number(key.slice(5,7)) - 1, 1);
+  const mesNombre = inicioMes.toLocaleDateString('es-AR', {month:'long', year:'numeric'});
+  const mesActual = inicioMes.toLocaleDateString('es-AR', {month:'2-digit', year:'numeric'});
   const nuevosDelMes = list.filter(s => s.joinDate === mesActual);
 
-  const pagosDelMes = [];
-  list.forEach(s=>{
-    (s.pagos || []).forEach(p=>{
-      const f = new Date(p.fecha);
-      if(f.getMonth() === hoy.getMonth() && f.getFullYear() === hoy.getFullYear()){
-        pagosDelMes.push({ ...p, alumno: s.name, fechaObj: f });
-      }
-    });
-  });
-  pagosDelMes.sort((a,b)=> b.fechaObj - a.fechaObj);
-  const totalCobradoMes = pagosDelMes.reduce((a,p)=>a+(p.monto||0),0);
-  const porMetodo = {};
-  pagosDelMes.forEach(p=>{ porMetodo[p.metodo] = (porMetodo[p.metodo]||0) + (p.monto||0); });
+  const pagosDelMes = fin.pagos.slice().sort((a,b)=> b.fechaObj - a.fechaObj);
+  const totalCobradoMes = fin.cobrado;
+  const porMetodo = fin.porMetodo;
+  const gastos = fin.totalGastos; // $0 si no hay gastos registrados para ese mes
+  const margenNeto = fin.neto;
+  const listaGastos = fin.gastos.slice().sort((a,b) => String(a.fecha).localeCompare(String(b.fecha)));
 
-  const gastosStr = prompt('¿Gastos totales del mes? (alquiler, sueldos, etc. — opcional, para calcular el margen neto)', '');
-  const gastos = gastosStr ? Number(gastosStr) || 0 : null;
-  const margenNeto = gastos !== null ? totalCobradoMes - gastos : null;
-
-  const estadoLabel = {ok:'Al día',warn:'Por vencer',bad:'Vencida',pending:'Sin asignar',frozen:'Congelada'};
-  const estadoColor = {ok:'#3fae6a',warn:'#e0a53f',bad:'#c8443a',pending:'#8a8a8a',frozen:'#1f7fa0'};
+  const estadoLabel = {ok:'Al día',warn:'Por vencer',bad:'Vencida',pending:'Sin asignar',frozen:'Congelada',nodate:'Sin fecha de venc.'};
+  const estadoColor = {ok:'#3fae6a',warn:'#e0a53f',bad:'#c8443a',pending:'#8a8a8a',frozen:'#1f7fa0',nodate:'#8a8a8a'};
 
   const html = `<!DOCTYPE html>
 <html lang="es"><head><meta charset="UTF-8">
@@ -4226,11 +4888,17 @@ function handleDownloadResumen(){
   </div>
 
   <div class="financiero">
-    <div class="row"><span>Ingresos brutos (cobrado este mes)</span><span>$${totalCobradoMes.toLocaleString('es-AR')}</span></div>
-    <div class="row"><span>Total facturable (si todos pagaran)</span><span>$${totalFacturable.toLocaleString('es-AR')}</span></div>
-    ${gastos !== null ? `<div class="row"><span>Gastos del mes</span><span>-$${gastos.toLocaleString('es-AR')}</span></div>
-    <div class="row"><span>Margen neto</span><span>$${margenNeto.toLocaleString('es-AR')}</span></div>` : `<div class="row"><span style="color:rgba(242,237,228,.5);font-size:.8rem;">Margen neto no calculado (no se cargaron gastos del mes)</span><span></span></div>`}
+    <div class="row"><span>Ingresos reales (cobrado en el mes)</span><span>$${totalCobradoMes.toLocaleString('es-AR')}</span></div>
+    <div class="row"><span>Gastos del mes${listaGastos.length ? '' : ' (sin gastos registrados)'}</span><span>-$${gastos.toLocaleString('es-AR')}</span></div>
+    <div class="row"><span>Resultado neto</span><span>${margenNeto < 0 ? '-' : ''}$${Math.abs(margenNeto).toLocaleString('es-AR')}</span></div>
   </div>
+  ${esMesActual ? `<p style="font-size:.8rem;color:rgba(242,237,228,.6);margin:-14px 0 24px;">Referencia (no es ingreso): proyectado mensual con planes activos $${totalFacturable.toLocaleString('es-AR')} · pendiente por cuotas vencidas $${fin.pendienteVencidas.toLocaleString('es-AR')}.</p>` : ''}
+  ${fin.errorGastos ? `<p style="font-size:.8rem;color:#e0574a;margin-bottom:20px;">Atención: no se pudieron leer los gastos guardados (${fin.errorGastos}); se tomaron como $0.</p>` : ''}
+
+  <div class="section-title">Gastos del mes</div>
+  <table><thead><tr><th>Fecha</th><th>Concepto</th><th>Monto</th></tr></thead><tbody>
+    ${listaGastos.length ? listaGastos.map(g=>`<tr><td>${fmtFechaCorta(g.fecha)}</td><td>${escapeHTML(g.concepto)}</td><td>$${(Number(g.monto)||0).toLocaleString('es-AR')}</td></tr>`).join('') : '<tr><td colspan="3" style="color:rgba(242,237,228,.5);">Sin gastos registrados para este mes ($0).</td></tr>'}
+  </tbody></table>
 
   <div class="section-title">Ingresos por método de pago</div>
   <table><thead><tr><th>Método</th><th>Total</th></tr></thead><tbody>
@@ -4249,7 +4917,7 @@ function handleDownloadResumen(){
     ${pagosDelMes.map(p=>`<tr><td>${p.fechaObj.toLocaleDateString('es-AR')}</td><td>${p.alumno}</td><td>${p.plan}</td><td>$${(p.monto||0).toLocaleString('es-AR')}</td><td>${p.metodo}</td></tr>`).join('')}
   </tbody></table>` : ''}
 
-  <div class="section-title">Estado general de alumnos</div>
+  <div class="section-title">Estado actual de alumnos (al ${fechaStr})</div>
   <table><thead><tr><th>Alumno</th><th>Plan</th><th>Monto</th><th>Vencimiento</th><th>Estado</th></tr></thead><tbody>
     ${list.map(s=>`<tr><td>${s.name}</td><td>${s.plan}</td><td>$${(s.amount||0).toLocaleString('es-AR')}</td><td>${s.due ? s.due.toLocaleDateString('es-AR') : '-'}</td><td><span class="badge" style="background:${estadoColor[s.quota]}33;color:${estadoColor[s.quota]};">${estadoLabel[s.quota] || s.quota}</span></td></tr>`).join('')}
   </tbody></table>
@@ -4261,7 +4929,7 @@ function handleDownloadResumen(){
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = `resumen-sinergia-${hoy.toISOString().slice(0,10)}.html`;
+  a.download = `resumen-sinergia-${key}.html`;
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
@@ -4269,7 +4937,7 @@ function handleDownloadResumen(){
 }
 
 function renderBars(containerId, data){
-  const max = Math.max(...data.map(d=>d.value));
+  const max = Math.max(...data.map(d=>d.value), 1);
   document.getElementById(containerId).innerHTML = data.map(d=>`
     <div class="bar-col"><div class="bar" style="height:${Math.max(6,(d.value/max*100))}%;"></div><span class="bar-label">${d.label}</span></div>`).join('');
 }
@@ -4283,12 +4951,6 @@ function renderDonut(containerId, values){
   const stops = values.map(v=>{ const start = acc/total*360; acc += v.value; const end = acc/total*360; return `${v.color} ${start}deg ${end}deg`; }).join(', ');
   document.getElementById(containerId).style.background = `conic-gradient(${stops})`;
 }
-function getInicioMes(date = new Date()){
-  return new Date(date.getFullYear(), date.getMonth(), 1, 0, 0, 0, 0);
-}
-function getFinMes(date = new Date()){
-  return new Date(date.getFullYear(), date.getMonth() + 1, 0, 23, 59, 59, 999);
-}
 function mesKey(date){
   return `${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,'0')}`;
 }
@@ -4301,7 +4963,10 @@ function mesLabel(key){
 function getTodosLosPagos(){
   const todos = [];
   ALUMNOS_REALES.forEach(s => {
-    (s.pagos || []).forEach(p => todos.push({ ...p, alumno: s.name, fechaObj: new Date(p.fecha) }));
+    (s.pagos || []).forEach(p => {
+      const fechaObj = fechaPago(p);
+      if(fechaObj) todos.push({ ...p, monto: Number(p.monto) || 0, alumno: s.name, fechaObj });
+    });
   });
   return todos;
 }
@@ -4335,70 +5000,100 @@ function renderCharts(){
       <div class="pbar"><div style="width:${s.completion}%;"></div></div></div>`).join('')
     : '<p style="font-size:.85rem;color:var(--off-dim);">Todavía no hay alumnos registrados.</p>';
 
-  // Ingresos del mes actual (real, no de ejemplo) para la tarjeta del Dashboard.
-  const inicioMes = getInicioMes(), finMes = getFinMes();
-  const totalMesActual = pagos.filter(p => p.fechaObj >= inicioMes && p.fechaObj <= finMes).reduce((a,p)=>a+(p.monto||0),0);
-  const elTotalMes = document.getElementById('totalIngresosMesActual');
-  if(elTotalMes) elTotalMes.textContent = fmtMoney(totalMesActual);
+  // Los KPIs financieros (cobrado, proyectado, gastos, neto) se calculan en renderKpisFinancieros(),
+  // que se llama desde renderDashboard(): ya no dependen de entrar a Estadísticas.
+  renderKpisFinancieros();
 }
 
-// ===== Historial mensual de facturación (basado en los pagos reales guardados por alumno) =====
-function renderHistorialMensual(){
-  const pagos = getTodosLosPagos();
-  const porMes = {};
-  pagos.forEach(p => {
-    const key = mesKey(p.fechaObj);
-    (porMes[key] = porMes[key] || []).push(p);
-  });
-  // Aseguramos que el mes actual siempre aparezca en la lista, aunque todavía no tenga pagos cargados.
-  porMes[mesKey(new Date())] = porMes[mesKey(new Date())] || [];
-  const meses = Object.keys(porMes).sort().reverse();
+// ===== Historial mensual / cierre mensual (pagos reales + gastos guardados en Firestore) =====
+async function renderHistorialMensual(){
   const cont = document.getElementById('historialMensualGrid');
   if(!cont) return;
-  if(!meses.length){
-    cont.innerHTML = '<p style="font-size:.85rem;color:var(--off-dim);">Todavía no hay pagos registrados.</p>';
-    return;
-  }
-  cont.innerHTML = meses.map(key => {
-    const lista = porMes[key];
-    const total = lista.reduce((a,p)=>a+(p.monto||0),0);
-    return `
-      <div class="card" style="cursor:pointer;" onclick="openHistorialMesModal('${key}')">
-        <span class="eyebrow" style="margin-bottom:4px;">${mesLabel(key)}</span>
-        <div class="price" style="font-size:1.8rem;margin:6px 0;">${fmtMoney(total)}</div>
-        <p style="font-size:.78rem;color:var(--off-dim);">${lista.length} pago${lista.length===1?'':'s'} registrado${lista.length===1?'':'s'}</p>
-      </div>`;
-  }).join('');
+  pintarHistorialMensual(null);
+  const error = await cargarTodasLasFinanzas();
+  pintarHistorialMensual(error);
 }
 
-function openHistorialMesModal(key){
-  const pagos = getTodosLosPagos().filter(p => mesKey(p.fechaObj) === key);
-  const total = pagos.reduce((a,p)=>a+(p.monto||0),0);
+function pintarHistorialMensual(errorFinanzas){
+  const cont = document.getElementById('historialMensualGrid');
+  if(!cont) return;
+  const meses = new Set(getTodosLosPagos().map(p => mesKey(p.fechaObj)));
+  Object.keys(FINANZAS_CACHE).forEach(k => { if(FINANZAS_CACHE[k].cargado) meses.add(k); });
+  meses.add(mesKey(new Date())); // el mes actual siempre aparece, aunque no tenga pagos
+  const lista = Array.from(meses).sort().reverse();
+  cont.innerHTML = (errorFinanzas ? `<p style="font-size:.8rem;color:#e0574a;grid-column:1/-1;">No se pudieron leer los gastos guardados (${escapeHTML(errorFinanzas)}). Los ingresos se muestran igual.</p>` : '') +
+    lista.map(key => {
+      const f = calcularFinanzasMes(key);
+      return `
+      <div class="card" style="cursor:pointer;" onclick="openHistorialMesModal('${key}')">
+        <span class="eyebrow" style="margin-bottom:4px;">${mesLabel(key)}${f.cierre ? ' · cerrado' : ''}</span>
+        <div class="price" style="font-size:1.8rem;margin:6px 0;">${fmtMoney(f.cobrado)}</div>
+        <p style="font-size:.78rem;color:var(--off-dim);">Cobrado · ${f.cantidadPagos} pago${f.cantidadPagos===1?'':'s'}</p>
+        <div class="field-row" style="font-size:.8rem;"><span>Gastos</span><span>${fmtMoney(f.totalGastos)}</span></div>
+        <div class="field-row" style="font-size:.8rem;"><span>Resultado neto</span><strong style="color:${f.neto < 0 ? '#e0574a' : 'var(--off)'};">${fmtMoney(f.neto)}</strong></div>
+      </div>`;
+    }).join('');
+}
+
+async function openHistorialMesModal(key){
+  const previo = document.getElementById('historialMesModalDinamico');
+  if(!FINANZAS_CACHE[key] || !FINANZAS_CACHE[key].cargado) await cargarFinanzasMes(key, true);
+  const f = calcularFinanzasMes(key);
   const mesActualKey = mesKey(new Date());
-  const inicioMes = new Date(...key.split('-').map((v,i)=>i===1?Number(v)-1:Number(v)), 1);
-  const finMesDate = new Date(inicioMes.getFullYear(), inicioMes.getMonth()+1, 0, 23,59,59,999);
+  const esMesActual = key === mesActualKey;
+  const inicioMes = new Date(Number(key.slice(0,4)), Number(key.slice(5,7)) - 1, 1);
   const nuevosDelMes = ALUMNOS_REALES.filter(s => s.joinDate && s.joinDate === inicioMes.toLocaleDateString('es-AR', {month:'2-digit', year:'numeric'})).length;
-  pagos.sort((a,b)=> b.fechaObj - a.fechaObj);
+  const pagos = f.pagos.slice().sort((a,b)=> b.fechaObj - a.fechaObj);
   const listaHTML = pagos.length
-    ? pagos.map(p => `<div class="field-row"><span>${fmtDate(p.fechaObj)} · ${p.alumno}</span><span>${fmtMoney(p.monto||0)} · ${p.metodo||'—'}</span></div>`).join('')
+    ? pagos.map(p => `<div class="field-row"><span>${fmtDate(p.fechaObj)} · ${escapeHTML(p.alumno)}</span><span>${fmtMoney(p.monto||0)} · ${escapeHTML(p.metodo||'—')}</span></div>`).join('')
     : '<p style="font-size:.8rem;color:var(--off-dim);">Sin pagos registrados este mes.</p>';
-  const nota = key === mesActualKey ? '' : `<p style="font-size:.72rem;color:var(--off-dim);margin-top:10px;">Nota: las bajas de membresía no quedan guardadas en el historial (al cancelar, el alumno se borra del sistema), por eso esta vista no puede mostrar "bajas" de meses anteriores.</p>`;
+  const gastosHTML = f.gastos.length
+    ? f.gastos.slice().sort((a,b) => String(b.fecha).localeCompare(String(a.fecha))).map(g => `
+        <div class="field-row"><span>${fmtFechaCorta(g.fecha)} · ${escapeHTML(g.concepto)}</span>
+          <span style="display:flex;gap:10px;align-items:center;">${fmtMoney(Number(g.monto)||0)}
+            <span style="cursor:pointer;color:#e0574a;padding:2px 6px;" title="Borrar gasto" onclick="borrarGastoMes('${key}','${g.id}')">✕</span></span></div>`).join('')
+    : '<p style="font-size:.8rem;color:var(--off-dim);">Todavía no hay gastos registrados para este mes ($0).</p>';
+  const hoyYMD = fechaLocalYMD(new Date());
+  const fechaDefault = esMesActual ? hoyYMD : key + '-01';
+  const cierreHTML = f.cierre ? `<p style="font-size:.76rem;color:var(--off-dim);margin-top:8px;">Cierre guardado el ${fmtDate(new Date(f.cierre.cerradoEn))}: cobrado ${fmtMoney(f.cierre.cobrado)}, gastos ${fmtMoney(f.cierre.totalGastos)}, neto ${fmtMoney(f.cierre.neto)}.${f.cierre.cobrado !== f.cobrado ? ' <strong style="color:var(--warn);">Los pagos actuales difieren del cierre guardado (¿se eliminó algún alumno o se registraron pagos después?).</strong>' : ''}</p>` : '';
+  const nota = esMesActual ? '' : `<p style="font-size:.72rem;color:var(--off-dim);margin-top:10px;">Nota: al eliminar un alumno se borran sus pagos. Guardar el cierre del mes deja un respaldo de los totales y del detalle de pagos.</p>`;
   const modalHTML = `
     <div class="modal-overlay active" id="historialMesModalDinamico" onclick="if(event.target===this) this.remove();">
-      <div class="modal-box">
+      <div class="modal-box" style="max-width:560px;">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
           <h3 style="margin:0;">${mesLabel(key)}</h3>
-          <span style="cursor:pointer;color:var(--off-dim);" onclick="document.getElementById('historialMesModalDinamico').remove();">✕</span>
+          <span style="cursor:pointer;color:var(--off-dim);padding:6px;" onclick="document.getElementById('historialMesModalDinamico').remove();">✕</span>
         </div>
-        <div class="grid grid-2" style="margin-bottom:16px;">
-          <div class="card stat-card"><span class="num">${fmtMoney(total)}</span><span class="label">Total facturado</span></div>
-          <div class="card stat-card"><span class="num">${nuevosDelMes}</span><span class="label">Alumnos nuevos ese mes</span></div>
+        ${f.errorGastos ? `<p class="auth-error" style="margin-bottom:12px;">No se pudieron leer los gastos (${escapeHTML(f.errorGastos)}).${f.errorGastos === 'permission-denied' ? ' Hay que permitir la colección "finanzas" en las reglas de Firestore.' : ''}</p>` : ''}
+        <div class="grid grid-2" style="margin-bottom:16px;gap:10px;">
+          <div class="card stat-card"><span class="num" style="font-size:1.5rem;">${fmtMoney(f.cobrado)}</span><span class="label">Ingresos reales (cobrado)</span></div>
+          <div class="card stat-card"><span class="num" style="font-size:1.5rem;">${fmtMoney(f.totalGastos)}</span><span class="label">Gastos</span></div>
+          <div class="card stat-card"><span class="num" style="font-size:1.5rem;color:${f.neto < 0 ? '#e0574a' : 'inherit'};">${fmtMoney(f.neto)}</span><span class="label">Resultado neto</span></div>
+          <div class="card stat-card"><span class="num" style="font-size:1.5rem;">${nuevosDelMes}</span><span class="label">Alumnos nuevos ese mes</span></div>
+        </div>
+        ${esMesActual ? `<p style="font-size:.78rem;color:var(--off-dim);margin-bottom:14px;">Aparte (no suma como ingreso): proyectado mensual ${fmtMoney(f.proyectado)} · pendiente por cuotas vencidas ${fmtMoney(f.pendienteVencidas)}.</p>` : ''}
+        <h4 style="margin-bottom:10px;">Gastos del mes</h4>
+        ${gastosHTML}
+        <div style="margin:12px 0 18px;padding:12px;border:1px dashed rgba(242,237,228,.18);border-radius:10px;">
+          <div class="grid grid-2" style="gap:8px;">
+            <div style="grid-column:1/-1;"><label for="gastoConcepto">Concepto</label><input id="gastoConcepto" type="text" placeholder="Ej: Alquiler, sueldos, luz" style="font-size:16px;"></div>
+            <div><label for="gastoMonto">Monto ($)</label><input id="gastoMonto" type="text" inputmode="decimal" placeholder="Ej: 150000" style="font-size:16px;"></div>
+            <div><label for="gastoFecha">Fecha</label><input id="gastoFecha" type="date" value="${fechaDefault}" min="${key}-01" max="${fechaLocalYMD(new Date(inicioMes.getFullYear(), inicioMes.getMonth()+1, 0))}" style="font-size:16px;"></div>
+          </div>
+          <div class="auth-error" id="gastoError" role="alert"></div>
+          <button type="button" class="btn btn-solid btn-small" id="gastoBtn" onclick="agregarGastoMes('${key}')">Agregar gasto</button>
         </div>
         <h4 style="margin-bottom:10px;">Pagos del mes</h4>
         ${listaHTML}
+        ${cierreHTML}
+        <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:16px;padding-top:14px;border-top:1px solid rgba(242,237,228,.12);">
+          <button type="button" class="btn btn-ghost btn-small" onclick="guardarCierreMes('${key}')">💾 ${f.cierre ? 'Actualizar cierre del mes' : 'Guardar cierre del mes'}</button>
+          <button type="button" class="btn btn-solid btn-small" onclick="handleDownloadResumen('${key}')">⬇ Descargar resumen</button>
+        </div>
         ${nota}
       </div>
     </div>`;
+  if(previo) previo.remove();
   document.body.insertAdjacentHTML('beforeend', modalHTML);
 }
 
@@ -4468,7 +5163,7 @@ function renderMiPerfil(){
       <div class="card"><h4>Estado de membresía</h4>
         <div class="field-row"><span>Plan</span><span>${s.plan}</span></div>
         <div class="field-row"><span>Estado</span><span>${badgeFor(s.quota)}</span></div>
-        <div class="field-row"><span>Próximo vencimiento</span><span>${fmtDate(s.due)}</span></div>
+        <div class="field-row"><span>Próximo vencimiento</span><span>${fmtVencimiento(s)}</span></div>
       </div>
       <div class="card"><h4>Resumen</h4>
         <p style="font-size:.8rem;margin-bottom:8px;">Cumplimiento de rutinas</p>
@@ -4526,15 +5221,64 @@ function cuentaBloqueadaPorCuota(s){
   return s.quota === 'bad';
 }
 function renderAvisoCuotaVencida(s){
+  const diasVencida = s.due ? Math.max(1, Math.round((new Date().setHours(0,0,0,0) - s.due.getTime()) / 86400000)) : null;
   return `
-    <div class="card" style="text-align:center;padding:32px 20px;border:1px solid #e0574a55;">
-      <div style="font-size:2.2rem;margin-bottom:10px;">🔒</div>
-      <h3 style="margin-bottom:8px;">Tu cuota está vencida</h3>
-      <p style="font-size:.88rem;color:var(--off-dim);max-width:360px;margin:0 auto 18px;">
-        Para volver a ver tus rutinas y marcar tu progreso, primero regularizá tu cuota. En cuanto quede registrado el pago, recuperás el acceso automáticamente — no se pierde nada de lo que ya tenías cargado.
-      </p>
-      <span class="btn btn-solid btn-small" onclick="showView('miCuota')">Ver cómo pagar mi cuota</span>
+    <div class="card" style="padding:26px 20px;border:1px solid #e0574a55;">
+      <div style="display:flex;gap:14px;align-items:flex-start;flex-wrap:wrap;">
+        <div style="font-size:2rem;line-height:1;">⏸️</div>
+        <div style="flex:1;min-width:220px;">
+          <h3 style="margin-bottom:6px;">Tus rutinas están en pausa</h3>
+          <p style="font-size:.88rem;color:var(--off-dim);margin-bottom:6px;">
+            Tu cuota está <strong style="color:#e0574a;">vencida</strong>${s.due ? ` desde el ${fmtDate(s.due)}${diasVencida ? ` (hace ${diasVencida} día${diasVencida===1?'':'s'})` : ''}` : ''}.
+            Hasta que se registre el pago no vas a poder ver ni marcar tus rutinas.
+          </p>
+          <p style="font-size:.82rem;color:var(--off-dim);margin-bottom:16px;">
+            Tu cuenta sigue activa: podés entrar, ver tu perfil, tu progreso, tu código de acceso y toda la info de tu cuota. No se pierde nada de lo que tenías cargado.
+          </p>
+          <div style="display:flex;gap:10px;flex-wrap:wrap;">
+            <span class="btn btn-solid btn-small" onclick="abrirDetalleMiCuota()">Ver mi cuota</span>
+            <span class="btn btn-ghost btn-small" onclick="showView('miCuota')">Cómo pagar</span>
+          </div>
+        </div>
+      </div>
     </div>`;
+}
+
+function ultimoPagoDe(s){
+  const pagos = (s.pagos || []).filter(p => p && p.fecha).slice().sort((a,b) => new Date(a.fecha) - new Date(b.fecha));
+  return pagos.length ? pagos[pagos.length-1] : null;
+}
+
+// Detalle de la cuota del alumno (se puede consultar SIEMPRE, aunque esté vencida).
+function abrirDetalleMiCuota(){
+  const s = currentStudentReal;
+  if(!s) { showView('miCuota'); return; }
+  const previo = document.getElementById('detalleCuotaModalDinamico');
+  if(previo) previo.remove();
+  const DESCUENTO_EFECTIVO = 2000;
+  const ult = ultimoPagoDe(s);
+  const tienePlan = s.plan && s.plan !== 'Sin asignar';
+  const html = `
+    <div class="modal-overlay active" id="detalleCuotaModalDinamico" style="z-index:600;padding:16px;" onclick="if(event.target===this) this.remove();">
+      <div class="modal-box" style="max-width:420px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">
+          <h3 style="margin:0;">Mi cuota</h3>
+          <span style="cursor:pointer;color:var(--off-dim);padding:6px;" onclick="document.getElementById('detalleCuotaModalDinamico').remove();">✕</span>
+        </div>
+        <div class="field-row"><span>Plan</span><span>${escapeHTML(s.plan)}</span></div>
+        <div class="field-row"><span>Monto</span><span>${fmtMoney(s.amount)}</span></div>
+        ${tienePlan && s.amount ? `<div class="field-row"><span>En efectivo</span><span>${fmtMoney(Math.max(0, s.amount - DESCUENTO_EFECTIVO))}</span></div>` : ''}
+        <div class="field-row"><span>Estado</span><span>${badgeFor(s.quota)}</span></div>
+        <div class="field-row"><span>Vencimiento</span><span>${fmtVencimiento(s)}</span></div>
+        <div class="field-row"><span>Último pago</span><span>${ult ? `${fmtDate(new Date(ult.fecha))} · ${fmtMoney(Number(ult.monto)||0)}${ult.metodo ? ' · ' + escapeHTML(ult.metodo) : ''}` : 'Sin pagos registrados'}</span></div>
+        ${s.quota === 'bad' ? '<p style="font-size:.8rem;color:var(--off-dim);margin:12px 0 0;">Tu cuenta sigue activa. Solo las rutinas quedan en pausa hasta que el gimnasio registre el pago.</p>' : ''}
+        ${tienePlan ? `
+          <button type="button" class="btn btn-solid" style="width:100%;margin-top:16px;padding:12px;" onclick="handleCopiarAlias()">📋 Copiar alias para transferir</button>
+          <p style="margin-top:8px;font-size:.76rem;color:var(--off-dim);text-align:center;">Alias: ${escapeHTML(GYM_ALIAS)}</p>` :
+          '<p style="margin-top:14px;font-size:.8rem;color:var(--off-dim);">Todavía no tenés un plan asignado. Hablá con el gimnasio.</p>'}
+      </div>
+    </div>`;
+  document.body.insertAdjacentHTML('beforeend', html);
 }
 
 function renderMisRutinas(){
@@ -4611,7 +5355,7 @@ async function renderInicio(){
         <span class="eyebrow">Mi cuenta</span>
         <div class="field-row"><span>Plan</span><span>${s.plan}</span></div>
         <div class="field-row"><span>Estado</span><span>${badgeFor(s.quota)}</span></div>
-        <div class="field-row"><span>Próximo vencimiento</span><span>${fmtDate(s.due)}</span></div>
+        <div class="field-row"><span>Próximo vencimiento</span><span>${fmtVencimiento(s)}</span></div>
       </div>
     </div>
     <div class="card" style="margin-bottom:20px;">
@@ -4673,7 +5417,7 @@ function startWorkout(sid, diaKey){
   const isReal = currentStudentReal && currentStudentReal.id === sid;
   const s = isReal ? currentStudentReal : STUDENTS[sid];
   if(isReal && cuentaBloqueadaPorCuota(s)){
-    alert('Tu cuota está vencida. Regularizala para poder entrenar de nuevo.');
+    showToast('⏸️ Tus rutinas están en pausa porque la cuota está vencida. Tu cuenta sigue activa: consultá tu cuota en "Mi cuota".', true);
     return;
   }
   const dia = s.rutinaActiva.dias[diaKey];
@@ -4781,20 +5525,116 @@ function markExerciseDoneFromWorkout(sid, diaKey, ei){
   }
 }
 
+// ===== MODAL NUMÉRICO PROPIO (reemplaza prompt() para peso corporal y peso de ejercicios) =====
+// Devuelve una Promise: { accion:'guardar', valor:Number } | { accion:<valor secundario> } | null (canceló).
+let modalNumeroResolver = null;
+
+function validarNumeroIngresado(texto, min, max, unidad){
+  const limpio = String(texto == null ? '' : texto).trim().replace(',', '.');
+  if(!limpio) return { ok:false, error:'Este campo es obligatorio.' };
+  if(limpio.startsWith('-')) return { ok:false, error:'El valor no puede ser negativo.' };
+  if(!/^\d+(\.\d+)?$/.test(limpio)) return { ok:false, error:'Ingresá un número válido (ej: 22 o 22,5).' };
+  const valor = Number(limpio);
+  if(!isFinite(valor)) return { ok:false, error:'Ingresá un número válido.' };
+  if(min !== undefined && valor < min) return { ok:false, error:`El valor mínimo es ${String(min).replace('.', ',')} ${unidad}.` };
+  if(max !== undefined && valor > max) return { ok:false, error:`El valor máximo es ${String(max).replace('.', ',')} ${unidad}. Revisá que esté bien escrito.` };
+  return { ok:true, valor: Math.round(valor * 100) / 100 };
+}
+
+function cerrarModalNumero(resultado){
+  const el = document.getElementById('modalNumeroDinamico');
+  if(el) el.remove();
+  document.removeEventListener('keydown', modalNumeroKeydown);
+  const resolver = modalNumeroResolver;
+  modalNumeroResolver = null;
+  if(resolver) resolver(resultado);
+}
+function modalNumeroKeydown(e){ if(e.key === 'Escape') cerrarModalNumero(null); }
+
+function abrirModalNumero(opts){
+  opts = opts || {};
+  const unidad = opts.unidad || 'kg';
+  if(modalNumeroResolver) cerrarModalNumero(null); // nunca dos modales a la vez
+  return new Promise(resolve => {
+    modalNumeroResolver = resolve;
+    const valorInicial = (opts.valorInicial === undefined || opts.valorInicial === null || opts.valorInicial === '' || Number(opts.valorInicial) === 0)
+      ? '' : String(opts.valorInicial).replace('.', ',');
+    const html = `
+      <div class="modal-overlay active" id="modalNumeroDinamico" style="z-index:600;padding:16px;align-items:center;">
+        <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="mnTitulo" style="max-width:380px;">
+          <h3 id="mnTitulo" style="margin:0 0 12px;">${escapeHTML(opts.titulo || 'Registrar')}</h3>
+          ${opts.detalle ? `<p style="font-size:.85rem;color:var(--off-dim);margin-bottom:14px;">${opts.detalle}</p>` : ''}
+          <form id="mnForm" novalidate>
+            <label for="mnInput">${escapeHTML(opts.label || 'Valor')}</label>
+            <div style="display:flex;align-items:center;gap:10px;">
+              <input id="mnInput" type="text" inputmode="decimal" autocomplete="off" enterkeyhint="done"
+                value="${escapeHTML(valorInicial)}" placeholder="${escapeHTML(opts.placeholder || '')}"
+                style="flex:1;margin-bottom:0;font-size:16px;padding:12px;" aria-describedby="mnError">
+              <span style="font-weight:600;color:var(--off-dim);">${escapeHTML(unidad)}</span>
+            </div>
+            <div class="auth-error" id="mnError" role="alert" style="min-height:1.2em;margin:8px 0 4px;"></div>
+            <div style="display:flex;gap:10px;margin-top:10px;">
+              <button type="button" class="btn btn-ghost" id="mnCancelar" style="flex:1;padding:13px;">Cancelar</button>
+              <button type="submit" class="btn btn-solid" style="flex:1;padding:13px;">${escapeHTML(opts.textoGuardar || 'Guardar')}</button>
+            </div>
+            ${opts.accionSecundaria ? `<button type="button" id="mnSecundaria" style="display:block;width:100%;margin-top:14px;background:none;border:none;color:var(--forge);font-size:.82rem;font-weight:600;cursor:pointer;padding:8px;">${escapeHTML(opts.accionSecundaria.texto)}</button>` : ''}
+          </form>
+        </div>
+      </div>`;
+    document.body.insertAdjacentHTML('beforeend', html);
+    const overlay = document.getElementById('modalNumeroDinamico');
+    const input = document.getElementById('mnInput');
+    const errorEl = document.getElementById('mnError');
+    overlay.addEventListener('click', e => { if(e.target === overlay) cerrarModalNumero(null); });
+    document.getElementById('mnCancelar').addEventListener('click', () => cerrarModalNumero(null));
+    const sec = document.getElementById('mnSecundaria');
+    if(sec) sec.addEventListener('click', () => cerrarModalNumero({ accion: opts.accionSecundaria.valor }));
+    input.addEventListener('input', () => { errorEl.textContent = ''; input.style.borderColor = ''; });
+    document.getElementById('mnForm').addEventListener('submit', e => {
+      e.preventDefault();
+      const r = validarNumeroIngresado(input.value, opts.min, opts.max, unidad);
+      if(!r.ok){ errorEl.textContent = r.error; input.style.borderColor = '#e0574a'; input.focus(); return; }
+      cerrarModalNumero({ accion: 'guardar', valor: r.valor });
+    });
+    document.addEventListener('keydown', modalNumeroKeydown);
+    setTimeout(() => { try{ input.focus(); input.select(); }catch(err){} }, 60);
+  });
+}
+
 async function toggleExercise(sid, diaKey, ei){
   const isReal = currentStudentReal && currentStudentReal.id === sid;
   const s = isReal ? currentStudentReal : STUDENTS[sid];
   if(isReal && cuentaBloqueadaPorCuota(s)){
-    alert('Tu cuota está vencida. Regularizala para poder seguir marcando tu progreso.');
+    showToast('⏸️ Tus rutinas están en pausa porque la cuota está vencida. Tu cuenta sigue activa: consultá tu cuota en "Mi cuota".', true);
     return;
   }
   const dia = s.rutinaActiva.dias[diaKey];
   const ex = dia.ejercicios[ei];
-  ex.done = !ex.done;
+  let historialActualizado = null;
 
-  if(ex.done && isReal){
-    const pesoUsado = prompt('¿Qué peso usaste hoy? (kg, opcional — te sirve para la próxima)', ex.peso || '');
-    if(pesoUsado && !isNaN(Number(pesoUsado))) ex.peso = String(pesoUsado);
+  if(!ex.done && isReal){
+    if(modalNumeroResolver) return; // ya hay un modal de peso abierto (evita dobles toques)
+    const hist = getHistorialPeso(s, ex.nombre);
+    const ult = hist.length ? hist[hist.length-1] : null;
+    const res = await abrirModalNumero({
+      titulo: 'Registrar peso',
+      detalle: `Ejercicio: <strong style="color:var(--off);">${escapeHTML(ex.nombre)}</strong>` +
+        (ult ? `<br>La última vez usaste ${fmtPeso(ult.peso)} (${fmtFechaCorta(ult.fecha)}).` : ''),
+      label: 'Peso utilizado', unidad: 'kg',
+      valorInicial: ult ? ult.peso : ex.peso, placeholder: 'Ej: 22,5',
+      min: 0.5, max: 500,
+      accionSecundaria: { texto: 'Completar sin registrar peso (peso corporal / sin carga)', valor: 'sinPeso' }
+    });
+    if(!res) return; // canceló: el ejercicio queda sin marcar
+    // Puede haber cambiado de estado mientras el modal estaba abierto
+    if(ex.done) return;
+    ex.done = true;
+    if(res.accion === 'guardar'){
+      ex.peso = String(res.valor); // último peso, para mostrarlo rápido
+      historialActualizado = registrarPesoEnHistorial(s, ex, diaKey, res.valor);
+    }
+  }else{
+    ex.done = !ex.done;
   }
 
   recomputeStudentProgress(s);
@@ -4804,7 +5644,7 @@ async function toggleExercise(sid, diaKey, ei){
   const hechosDia = dia.ejercicios.filter(e=>e.done).length;
   const progresoDia = totalDia ? Math.round(hechosDia/totalDia*100) : 0;
   if(isReal && progresoDia === 100){
-    const hoyStr = new Date().toISOString().slice(0,10);
+    const hoyStr = fechaLocalYMD(new Date());
     s.sessions = s.sessions || [];
     const yaRegistrada = s.sessions.some(sesion => sesion.date === hoyStr && sesion.diaKey === diaKey);
     if(!yaRegistrada){
@@ -4822,9 +5662,12 @@ async function toggleExercise(sid, diaKey, ei){
 
   if(isReal){
     try{
-      await window.fb.setDoc(window.fb.doc(window.fb.db, 'users', sid), {
+      const payload = {
         rutinaActiva: s.rutinaActiva, completion: s.completion, sessions: s.sessions, workouts: s.workouts, caloriesTotal: s.caloriesTotal, notifications: s.notifications
-      }, { merge: true });
+      };
+      // Solo se escribe la clave del ejercicio tocado: el merge conserva el resto del historial.
+      if(historialActualizado) payload.historialPesos = { [historialActualizado.clave]: historialActualizado.lista };
+      await window.fb.setDoc(window.fb.doc(window.fb.db, 'users', sid), payload, { merge: true });
     }catch(err){ console.error('No se pudo guardar el progreso:', err); }
     renderMisRutinas();
     renderMiPerfil();
@@ -4995,14 +5838,19 @@ function renderMiProgreso(){
 async function handleRegistrarPeso(){
   const s = currentStudentReal;
   if(!s) return;
-  const pesoStr = prompt('¿Cuánto pesás hoy? (kg)', s.weight || '');
-  if(!pesoStr) return;
-  const peso = Number(pesoStr);
-  if(isNaN(peso) || peso <= 0){ alert('Ingresá un número válido.'); return; }
+  const res = await abrirModalNumero({
+    titulo: 'Registrar peso corporal', label: 'Peso', unidad: 'kg',
+    valorInicial: s.weight, placeholder: 'Ej: 74,5', min: 20, max: 350
+  });
+  if(!res || res.accion !== 'guardar') return;
+  const peso = res.valor;
   try{
-    const weightHistory = [...(s.weightHistory || []), peso].slice(-30);
-    await window.fb.setDoc(window.fb.doc(window.fb.db, 'users', s.id), { weight: peso, weightHistory }, { merge: true });
-    s.weight = peso; s.weightHistory = weightHistory;
+    const weightHistory = [...(s.weightHistory || []).filter(w => Number(w) > 0), peso].slice(-30);
+    // weightLog: mismo dato pero con fecha (weightHistory se mantiene igual por compatibilidad con el gráfico)
+    const weightLog = [...(s.weightLog || []), { peso, fecha: fechaLocalYMD(new Date()), ts: new Date().toISOString() }].slice(-200);
+    await window.fb.setDoc(window.fb.doc(window.fb.db, 'users', s.id), { weight: peso, weightHistory, weightLog }, { merge: true });
+    s.weight = peso; s.weightHistory = weightHistory; s.weightLog = weightLog;
+    showToast('✅ Peso registrado: ' + fmtPeso(peso), false);
     renderMiProgreso();
     renderMiPerfil();
   }catch(err){
@@ -5045,8 +5893,10 @@ function renderMiCuota(){
       <div class="card"><h4>Estado actual</h4>
         <div class="field-row"><span>Plan</span><span>${s.plan}</span></div>
         <div class="field-row"><span>Monto</span><span>${fmtMoney(s.amount)}</span></div>
-        <div class="field-row"><span>Vencimiento</span><span>${fmtDate(s.due)}</span></div>
+        <div class="field-row"><span>Vencimiento</span><span>${fmtVencimiento(s)}</span></div>
         <div class="field-row"><span>Estado</span><span>${badgeFor(s.quota)}</span></div>
+        ${(() => { const ult = ultimoPagoDe(s); return `<div class="field-row"><span>Último pago</span><span>${ult ? `${fmtDate(new Date(ult.fecha))} · ${fmtMoney(Number(ult.monto)||0)}${ult.metodo ? ' · ' + escapeHTML(ult.metodo) : ''}` : 'Sin pagos registrados'}</span></div>`; })()}
+        ${vencida ? '<p style="margin-top:12px;font-size:.8rem;color:var(--off-dim);">Tu cuenta sigue activa. Las rutinas quedan en pausa hasta que se registre el pago.</p>' : ''}
         ${payButtonHTML}
       </div>
       <div class="card"><h4>Planes disponibles</h4>
