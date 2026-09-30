@@ -4183,11 +4183,30 @@ async function confirmarAsignarPlantilla(){
     };
     payload.rutinasAnteriores = [...(s.rutinasAnteriores || []), archivada].slice(-5);
   }
-  // Si había historial viejo guardado DENTRO de los ejercicios (historialPeso), ya fue incorporado
-  // en memoria a s.historialPesos: se persiste ahora para que no dependa de la rutina que se reemplaza.
-  if(s.historialPesos && Object.keys(s.historialPesos).length) payload.historialPesos = s.historialPesos;
+  // Historial viejo guardado DENTRO de los ejercicios (historialPeso): hay que pasarlo a historialPesos
+  // antes de reemplazar la rutina. NO se usa la copia en memoria del admin (puede estar desactualizada y
+  // pisaría pesos que el alumno registró después): se relee el documento y se escriben SOLO las claves
+  // que ganan registros viejos, unidas con lo que ya está guardado en Firestore.
+  let historialFresco;
+  try{
+    const snap = await window.fb.getDoc(window.fb.doc(window.fb.db, 'users', uid));
+    const actual = snap.exists() ? snap.data() : {};
+    const guardado = (actual.historialPesos && typeof actual.historialPesos === 'object') ? actual.historialPesos : {};
+    historialFresco = normalizarHistorialPesos(guardado, actual.rutinaActiva || null);
+    const clavesConRegistrosViejos = Object.keys(historialFresco).filter(k =>
+      historialFresco[k].length > (Array.isArray(guardado[k]) ? guardado[k].length : 0));
+    if(clavesConRegistrosViejos.length){
+      payload.historialPesos = {};
+      clavesConRegistrosViejos.forEach(k => { payload.historialPesos[k] = historialFresco[k].slice(-MAX_REGISTROS_PESO_POR_EJERCICIO); });
+    }
+  }catch(err){
+    // Sin poder leer el estado actual no se reemplaza la rutina (evita perder historial).
+    errorEl.textContent = 'No se pudo verificar el historial del alumno (' + (err.code || err.message) + '). No se cambió la rutina.';
+    return;
+  }
   try{
     await window.fb.setDoc(window.fb.doc(window.fb.db, 'users', uid), payload, { merge: true });
+    s.historialPesos = historialFresco;
     s.rutinaActiva = clon;
     if(payload.rutinasAnteriores) s.rutinasAnteriores = payload.rutinasAnteriores;
     document.getElementById('assignRoutineModal').classList.remove('active');
