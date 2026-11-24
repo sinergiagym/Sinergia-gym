@@ -1,0 +1,69 @@
+rules_version = '2';
+// Reglas de seguridad — Sinergia (sede 2)
+// - El admin (users/{uid}.role == 'admin') puede leer y escribir todo.
+// - Cada alumno solo puede leer su propio documento y sus ingresos, y solo puede
+//   modificar sus datos de entrenamiento/perfil: nunca su plan, cuota, pagos ni rol.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function isAdmin() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+    // Campos que solo el admin puede tocar
+    function camposProtegidos() {
+      return ['role', 'plan', 'amount', 'vencimiento', 'vencimientoRef', 'cuotaInicio',
+              'pagos', 'frozen', 'membership', 'eliminado', 'due'];
+    }
+
+    match /users/{uid} {
+      allow read: if isAdmin() || (signedIn() && request.auth.uid == uid);
+      allow list: if isAdmin();
+
+      // Alta propia del alumno (registro desde la app): siempre como alumno, sin plan ni pagos.
+      allow create: if isAdmin() || (
+        signedIn() && request.auth.uid == uid
+        && request.resource.data.role == 'alumno'
+        && request.resource.data.get('plan', null) == null
+        && request.resource.data.get('amount', 0) == 0
+        && !('pagos' in request.resource.data)
+        && !('vencimiento' in request.resource.data)
+        && !('cuotaInicio' in request.resource.data)
+        && !('frozen' in request.resource.data)
+        && !('eliminado' in request.resource.data)
+      );
+
+      allow update: if isAdmin() || (
+        signedIn() && request.auth.uid == uid
+        && resource.data.get('eliminado', false) != true
+        && !request.resource.data.diff(resource.data).affectedKeys().hasAny(camposProtegidos())
+      );
+
+      allow delete: if isAdmin();
+
+      // Ingresos al gimnasio (los registra recepción/admin)
+      match /checkins/{checkinId} {
+        allow read: if isAdmin() || (signedIn() && request.auth.uid == uid);
+        allow write: if isAdmin();
+      }
+    }
+
+    // Planes, alias, banco de ejercicios, plantillas: lo leen todos los que inician sesión
+    match /config/{docId} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+
+    // Gastos y cierres mensuales: solo el admin
+    match /finanzas/{mes} {
+      allow read, write: if isAdmin();
+    }
+
+    // Cualquier otra cosa: cerrado
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
